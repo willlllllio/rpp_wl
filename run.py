@@ -237,10 +237,6 @@ def start(args):
 
 	fps_target: int = args["fps_target"]
 	if not args['keep_fps'] and fps_src > fps_target:
-		# source_fps_path = workdir / f"{source_path.name}_fps_{fps_target}.mp4"
-		# print("converting to fps", fps_target)
-		# set_fps(source_path, this_path, 30)
-		# source_path, src_fps = this_path, 30
 		fps_use = fps_target
 		fps_swapped = fps_target
 		print("limiting fps to", fps_use)

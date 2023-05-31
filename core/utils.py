@@ -25,11 +25,6 @@ def detect_fps(input_path, ffprobe = "ffprobe"):
 		raise ValueError("couldn't get fps", output)
 
 
-# def set_fps(input_path, output_path, fps):
-# 	input_path, output_path = path(input_path), path(output_path)
-# 	os.system(f'ffmpeg -i "{input_path}" -filter:v fps=fps={fps} "{output_path}"')
-
-
 def make_temp_name():
 	return f"{time.time_ns()}.{random.random()}.tmp"
 

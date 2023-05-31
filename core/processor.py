@@ -1,4 +1,5 @@
 import os
+import traceback
 from pathlib import Path
 
 import cv2
@@ -50,38 +51,46 @@ def process_video(source_img: Path, frame_paths: list[tuple[Path, Path]], load_o
 		swapper = get_face_swapper()
 
 	for (src_frame_path, target_frame_path) in frame_paths:
-		if skip_existing and target_frame_path.exists():
-			print("R", end = '', flush = True)
-			continue
-
-		frame = cv2.imread(str(src_frame_path))
-		try:
-			face = get_face(frame)
-		except Exception as ex:
-			print('F', end = '', flush = True)
-			continue
-
-		if face:
-			try:
-				# result = get_face_swapper().get(frame, face, source_face, paste_back = True)
-				result = swapper.get(frame, face, source_face, paste_back = True)
-			except Exception as ex:
-				print('E', end = '', flush = True)
-				continue
-
-			is_ok, buffer = cv2.imencode(".png", result)
-			if not is_ok:
-				raise ValueError("failed encoding image??")
-
-			write_atomic(buffer, target_frame_path, may_exist = False)
-			print('.', end = '', flush = True)
-		else:
-			print('S', end = '', flush = True)
+		res = process_frame(swapper, source_face, src_frame_path, target_frame_path, skip_existing)
+		if res:
+			print(res, end = '', flush = True)
 
 
-def process_img(source_img, target_path, output_file):
-	frame = cv2.imread(target_path)
+def process_frame(swapper, source_face, src_frame_path: Path, target_frame_path: Path, skip_existing: bool):
+	if skip_existing and target_frame_path.exists():
+		return "R"
+
+	frame = cv2.imread(str(src_frame_path))
+	try:
+		face = get_face(frame)
+	except Exception as ex:
+		return "F"
+
+	if not face:
+		return "S"
+
+	try:
+		result = swapper.get(frame, face, source_face, paste_back = True)
+	except Exception as ex:
+		traceback.print_exc()
+		return "E"
+
+	is_ok, buffer = cv2.imencode(".png", result)
+	if not is_ok:
+		raise ValueError("failed encoding image??")
+	write_atomic(buffer, target_frame_path, may_exist = False)
+	return "."
+
+
+def process_img(source_img: Path, frame_path: Path, output_file: Path):
+	source_face = get_face(cv2.imread(str(source_img)))
+	swapper = load_face_swapper()
+
+	frame = cv2.imread(str(frame_path))
 	face = get_face(frame)
-	source_face = get_face(cv2.imread(source_img))
-	result = get_face_swapper().get(frame, face, source_face, paste_back = True)
-	cv2.imwrite(output_file, result)
+	result = swapper.get(frame, face, source_face, paste_back = True)
+
+	is_ok, buffer = cv2.imencode(".png", result)
+	if not is_ok:
+		raise ValueError("failed encoding image??")
+	write_atomic(buffer, output_file, may_exist = False)
