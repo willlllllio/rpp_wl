@@ -25,6 +25,17 @@ def detect_fps(input_path, ffprobe = "ffprobe"):
 		raise ValueError("couldn't get fps", output)
 
 
+def detect_dimensions(input_path: Path, ffprobe = "ffprobe"):
+	output = subprocess.check_output([
+		ffprobe, "-v", "error", "-select_streams", "v", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x",
+		str(input_path)]
+	)
+
+	output = output.decode()
+	w, h = output.strip().split("x")
+	return int(w), int(h)
+
+
 def make_temp_name():
 	return f"{time.time_ns()}.{random.random()}.tmp"
 
@@ -60,10 +71,28 @@ def extract_frames(input_path, output_dir: Path, target_fps: Optional[int] = Non
 
 def create_video(frames_dir: Path, fps: int | float, target: Path, filename_pattern = "%05d.png", ffmpeg = "ffmpeg", extra_args = None):
 	subprocess.check_output([
-		ffmpeg, "-n", *(extra_args or []), "-framerate", str(fps),
+		ffmpeg, "-n", *(extra_args or []),
+		"-framerate", str(fps),
 		"-i", frames_dir / filename_pattern,
 		"-c:v", "libx264", "-crf", "7", "-pix_fmt", "yuv420p", str(target)
 	])
+
+
+def create_video_from_frame_gen(frame_gen, width: int, height: int, fps: int | float, target: Path, ffmpeg = "ffmpeg", extra_args = None,
+								finish_timeout = 10):
+	proc = subprocess.Popen([
+		ffmpeg, "-n", *(extra_args or []),
+		'-f', 'rawvideo', "-pix_fmt", "bgr24", "-video_size", f"{width}x{height}", "-framerate", str(fps), '-i', '-',
+		"-c:v", "libx264", "-crf", "7", "-pix_fmt", "yuv420p", "-r", str(fps), str(target),
+	],
+		stdin = subprocess.PIPE
+	)
+
+	for pos, frame_buf in enumerate(frame_gen):
+		proc.stdin.write(frame_buf)
+
+	proc.stdin.close()
+	proc.wait(finish_timeout)
 
 
 def add_audio(video_path: Path, audio_source_path: Path, target_path: Path, ffmpeg = "ffmpeg", extra_args = None):

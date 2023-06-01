@@ -4,6 +4,7 @@ import os
 import traceback
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 import cv2
 import insightface
@@ -59,13 +60,17 @@ class ProcessSettings():
 	load_own_model: bool
 	skip_existing: bool
 	error_handling: ProcErrorHandling = ProcErrorHandling.Log
-	progprint = builtins.print
+	progprint: Any = builtins.print
+
+	def progress(self, status):
+		self.progprint(status, end = "", flush = True)
 
 
 def process_video(source_img: Path, frame_paths: list[tuple[Path, Path]], settings: ProcessSettings):
 	source_face = get_face(cv2.imread(str(source_img)))
 	if not frame_paths:
 		return
+
 	if settings.load_own_model:
 		# needed to run multiple at the same time on the GPU, seems to give better utilization on some
 		swapper = load_face_swapper()
@@ -73,11 +78,23 @@ def process_video(source_img: Path, frame_paths: list[tuple[Path, Path]], settin
 		swapper = get_face_swapper()
 
 	for (src_frame_path, target_frame_path) in frame_paths:
-		res = process_frame(swapper, source_face, src_frame_path, target_frame_path, settings.skip_existing)
-		if res:
-			settings.progprint(res, end = '', flush = True)
+		if settings.skip_existing and target_frame_path.exists():
+			res = "R"
+		else:
+			src_frame = cv2.imread(str(src_frame_path))
+			res = process_frame(swapper, source_face, src_frame)
 
-		if res not in (".", "R"):
+		if not isinstance(res, str):
+			is_ok, buffer = cv2.imencode(".png", res)
+			if not is_ok:
+				logger.error("failed encoding image, %r", type(res))
+				settings.progress("P")
+			else:
+				settings.progress(".")
+				write_atomic(buffer, target_frame_path, may_exist = False)
+			del buffer, res
+		else:
+			settings.progress(res)
 			error_handling = settings.error_handling
 			if error_handling is ProcErrorHandling.Ignore:
 				continue
@@ -87,15 +104,38 @@ def process_video(source_img: Path, frame_paths: list[tuple[Path, Path]], settin
 				ensure(not target_frame_path.exists(), c = target_frame_path)
 				os.symlink(src_frame_path.absolute(), target_frame_path.absolute())
 			else:
-				#TODO
-				raise NotImplementedError(error_handling, src_frame_path, target_frame_path)
+				raise NotImplementedError(error_handling, src_frame_path, target_frame_path)  # TODO
 
 
-def process_frame(swapper, source_face, src_frame_path: Path, target_frame_path: Path, skip_existing: bool):
-	if skip_existing and target_frame_path.exists():
-		return "R"
+def process_gen(source_img: Path, frame_gen, settings: ProcessSettings):
+	source_face = get_face(cv2.imread(str(source_img)))
 
-	frame = cv2.imread(str(src_frame_path))
+	if settings.load_own_model:
+		# needed to run multiple at the same time on the GPU, seems to give better utilization on some
+		swapper = load_face_swapper()
+	else:
+		swapper = get_face_swapper()
+
+	for pos, src_frame in enumerate(frame_gen):
+		res = process_frame(swapper, source_face, src_frame)
+		if not isinstance(res, str):
+			settings.progress(".")
+			yield res
+		else:
+			settings.progress(res)
+			error_handling = settings.error_handling
+			if error_handling is ProcErrorHandling.Ignore:
+				continue
+
+			logger.info("processing error %r for frame %s, %s", res, pos, error_handling.name)
+			if error_handling is ProcErrorHandling.Copy:
+				yield src_frame
+			else:
+				raise NotImplementedError(res, error_handling, pos)  # TODO
+
+
+def process_frame(swapper, source_face, frame):
+
 	try:
 		face = get_face(frame)
 	except Exception as ex:
@@ -105,16 +145,10 @@ def process_frame(swapper, source_face, src_frame_path: Path, target_frame_path:
 		return "S"
 
 	try:
-		result = swapper.get(frame, face, source_face, paste_back = True)
+		return swapper.get(frame, face, source_face, paste_back = True)
 	except Exception as ex:
 		traceback.print_exc()
 		return "E"
-
-	is_ok, buffer = cv2.imencode(".png", result)
-	if not is_ok:
-		raise ValueError("failed encoding image??")
-	write_atomic(buffer, target_frame_path, may_exist = False)
-	return "."
 
 
 def process_img(source_img: Path, frame_path: Path, output_file: Path):

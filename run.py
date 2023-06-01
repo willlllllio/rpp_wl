@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 
+import os
+
+if not os.environ.get("SKIP_EARLY_TORCH") == "1":
+	import torch  # needs to be imported before onnx for GPU support to work easily apparently
+
 import platform
 import re
+import subprocess
 import sys
 import traceback
 
-import torch  # needs to be imported before onnx for GPU support to work
 import argparse
 import os
 from pathlib import Path
-from core.processor import process_video, process_img, get_face, ProcessSettings, ProcErrorHandling
-from core.utils import is_img, detect_fps, create_video, add_audio, extract_frames, ensure, Timer, create_video_with_audio
+
+import cv2
+import numpy as np
+
+from core.processor import process_video, process_img, get_face, ProcessSettings, ProcErrorHandling, process_gen
+from core.utils import is_img, detect_fps, create_video, add_audio, extract_frames, ensure, Timer, create_video_with_audio, detect_dimensions, ensure_equal, create_video_from_frame_gen
 import psutil
 
 # DEFAULT_FRAME_SUFFIX_ORG = "_org.png"
@@ -163,7 +172,6 @@ def output_args_replace(format_str: str, face_path: Path, source_path: Path):
 
 
 def start(args):
-	print("DON'T WORRY. IT'S NOT STUCK/CRASHED.\n" * 5)
 	face_path = Path(args["face"])
 	source_path = Path(args["source_vid"])
 	if not face_path:
@@ -177,9 +185,6 @@ def start(args):
 
 	if not source_path.exists():
 		return print("\n[WARNING] source_path not found", source_path)
-
-	name_suffix_org = args["name_suffix_org"]
-	name_suffix_swapped = args["name_suffix_swapped"]
 
 	ensure(not (args["output_vid_formatted"] and args["output_vid"]), c = "got both output_vid_formatted and output_vid")
 	if args["output_vid_formatted"]:
@@ -197,22 +202,9 @@ def start(args):
 
 	ensure(not output_path.exists(), c = ("output_path exists", output_path))
 
-	vid_output_audio: bool = args["vid_output_audio"]
-	output_path_plain = None
-	if args["vid_output_plain"]:
-		output_path_plain = output_path.with_suffix(".plain.mp4")
-		ensure(not output_path_plain.exists(), c = ("output_path_plain exists", output_path_plain))
-
-	ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info"])
-
 	with Timer("setgrad took {:.2f} secs"):
 		import torch
 		torch.set_grad_enabled(False)
-
-	# test_face = get_face(cv2.imread(str(face_path)))
-	# if not test_face:
-	# 	print("\n[WARNING] No face detected in source image. Please try with another one.\n")
-	# 	return
 
 	if source_path.is_file():
 		if is_img(source_path):
@@ -244,6 +236,108 @@ def start(args):
 		workdir = workdir / f"{output_path.name}.tmp"
 	else:
 		workdir = output_path.with_name(output_path.name + ".tmp")
+
+	stream = args["stream"]
+	with Timer("full processing took {:.4f} secs"):
+		if stream:
+			ensure(not source_path.is_dir(), c = "directory sources not implemented for stream")
+			process_streamed(args, source_path, face_path, workdir, output_path,
+							 fps_use, fps_swapped)
+		else:
+			process_using_frames(args, source_path, face_path, workdir, output_path,
+								 fps_use, fps_swapped)
+
+
+def process_streamed(
+		args: dict, source_path: Path, face_path: Path, workdir: Path,
+		output_path: Path,
+		# fps for frames to take from source, None if using all,
+		fps_use: int | float | None,
+		fps_swapped: int | float,  # fps that will be output, always same as fps_use if that is given
+):
+	vid_output_audio: bool = args["vid_output_audio"]
+	width, height = detect_dimensions(source_path, ffprobe = args["ffprobe"])
+
+	if vid_output_audio:
+		output_path_plain = output_path.with_suffix(".plain.mp4")
+		ensure(not output_path_plain.exists(), c = ("output_path_plain exists", output_path_plain))
+	else:
+		output_path_plain = output_path
+
+	# Note: cv2 VideoCapture is much faster (almost 2x) but has no way to easily skip frames,
+	# would have to get frame timestamps and implement skipping by hand when using fps_use.
+	# gen = _frame_gen_cv2(source_path)
+	gen = _frame_gen_ffmpeg(args, source_path, width, height, fps_use)
+
+	settings = ProcessSettings(True, False, ProcErrorHandling.Copy)
+	gen = process_gen(face_path, gen, settings)
+
+	# try:
+	# 	import tqdm
+	# 	gen = tqdm.tqdm(gen, total = )
+
+	# def proc(gen):
+	# 	for pos, i in enumerate(gen):
+	# 		print(f"swapped #{pos}")
+	# 		yield i
+	# gen = proc(gen)
+
+	create_video_from_frame_gen(gen, width, height, fps_swapped, output_path_plain)
+	if vid_output_audio:
+		ensure(output_path != output_path_plain)
+		ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info"])
+		add_audio(output_path_plain, source_path, output_path, **ffmpeg)
+
+
+def _frame_gen_ffmpeg(args, source_path: Path, width, height, fps_use: int | float | None, ):
+	ensure(width and height, c = (width, height))
+
+	img_size = width * height * 3
+	ffmpeg = [args["ffmpeg"], "-hide_banner", "-loglevel", "info"]
+	fps = ["-filter:v", f"fps=fps={fps_use}"] if fps_use else []
+	com = [
+		*ffmpeg,
+		"-i", str(source_path),
+		*fps,
+		"-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:"
+	]
+	proc = subprocess.Popen(com, stdout = subprocess.PIPE, bufsize = 128 * 1024 ** 2)
+	while True:
+		buffer = proc.stdout.read(img_size)
+		if not buffer:
+			break
+		ensure_equal(len(buffer), img_size)
+		frame = np.frombuffer(buffer, np.uint8).reshape(height, width, 3)
+		yield frame
+
+
+def _frame_gen_cv2(source_path: Path):
+	vidcap = cv2.VideoCapture(str(source_path))
+	count = 0
+	while True:
+		ok, frame = vidcap.read()
+		if not ok:
+			break
+		count += 1
+		yield frame
+
+
+def process_using_frames(
+		args: dict, source_path: Path, face_path: Path, workdir: Path,
+		output_path: Path,
+		# fps for frames to take from source, None if using all,
+		fps_use: int | float | None,
+		fps_swapped: int | float,  # fps that will be output, always same as fps_use if that is given
+):
+	vid_output_audio: bool = args["vid_output_audio"]
+	name_suffix_org = args["name_suffix_org"]
+	name_suffix_swapped = args["name_suffix_swapped"]
+	ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info"])
+
+	output_path_plain = None
+	if args["vid_output_plain"]:
+		output_path_plain = output_path.with_suffix(".plain.mp4")
+		ensure(not output_path_plain.exists(), c = ("output_path_plain exists", output_path_plain))
 
 	if source_path.is_file():
 		if args["frames_dir"]:
@@ -361,8 +455,10 @@ def make_parser():
 	parser.add_argument("--name_suffix_swapped", default = DEFAULT_FRAME_SUFFIX_SWAPPED,
 						help = "suffix (including extension) of original frame names")
 
-	parser.add_argument("--gpu", dest = "gpu", action = "store_true",
+	parser.add_argument("--gpu", action = "store_true",
 						help = "use gpu")
+	parser.add_argument("--stream", action = "store_true",
+						help = "no frame files just do everything in mem and write directly to plain output file")
 	parser.add_argument("--keep_frames", action = "store_true",
 						help = "keep frames directory")
 	parser.add_argument("--keep_fps", action = "store_true",
