@@ -9,10 +9,9 @@ import torch  # needs to be imported before onnx for GPU support to work
 import argparse
 import os
 from pathlib import Path
-from core.processor import process_video, process_img, get_face
+from core.processor import process_video, process_img, get_face, ProcessSettings, ProcErrorHandling
 from core.utils import is_img, detect_fps, create_video, add_audio, extract_frames, ensure, Timer, create_video_with_audio
 import psutil
-import cv2
 
 # DEFAULT_FRAME_SUFFIX_ORG = "_org.png"
 # DEFAULT_FRAME_SUFFIX_SWAPPED = "_swapped.png"
@@ -87,22 +86,23 @@ def _frames(frame_paths: list[Path], output_dir: Path, org_suffix: str, swapped_
 	return frames, todo, done
 
 
-def start_processing_cpu(face_img: Path, frame_paths: list[tuple[Path, Path]], load_own_model: bool, pool, procnum: int):
+def start_processing_cpu(face_img: Path, frame_paths: list[tuple[Path, Path]], settings: ProcessSettings, pool, procnum: int):
 	n = max(len(frame_paths) // procnum, 1)
 	processes = []
 	for i in range(0, len(frame_paths), n):
-		p = pool.apply_async(process_video, args = (face_img, frame_paths[i:i + n], load_own_model, False))
+		p = pool.apply_async(process_video, args = (face_img, frame_paths[i:i + n], settings))
 		processes.append(p)
 
 	for p in processes:
 		p.get()
 
 
-def start_processing_gpu(face_img: Path, frame_paths: list[tuple[Path, Path]], load_own_model: bool, pool, procnum: int):
-	if pool is not None and procnum > 1:
-		return start_processing_cpu(face_img, frame_paths, True, pool, procnum)
+def start_processing_gpu_multi(face_img: Path, frame_paths: list[tuple[Path, Path]], settings: ProcessSettings, pool, procnum: int):
+	return start_processing_cpu(face_img, frame_paths, settings, pool, procnum)
 
-	process_video(face_img, frame_paths, load_own_model, False)
+
+def start_processing_gpu_single(face_img: Path, frame_paths: list[tuple[Path, Path]], settings: ProcessSettings):
+	process_video(face_img, frame_paths, settings)
 
 
 def status(string):
@@ -227,14 +227,6 @@ def start(args):
 		fps_src = args["fps_source"]
 		ensure(fps_src, c = ("source_path is png sequence, manually passing --fps_source framerate argument required"))
 
-	if args["work_dir"]:
-		workdir = Path(args["work_dir"])
-	elif args["work_dir_root"]:
-		workdir = Path(args["work_dir_root"])
-		workdir = workdir / f"{output_path.name}.tmp"
-	else:
-		workdir = output_path.with_name(output_path.name + ".tmp")
-
 	fps_target: int = args["fps_target"]
 	if not args['keep_fps'] and fps_src > fps_target:
 		fps_use = fps_target
@@ -244,6 +236,14 @@ def start(args):
 		# 	shutil.copy(source_path, output_dir)
 		fps_use = None
 		fps_swapped = fps_src
+
+	if args["work_dir"]:
+		workdir = Path(args["work_dir"])
+	elif args["work_dir_root"]:
+		workdir = Path(args["work_dir_root"])
+		workdir = workdir / f"{output_path.name}.tmp"
+	else:
+		workdir = output_path.with_name(output_path.name + ".tmp")
 
 	if source_path.is_file():
 		if args["frames_dir"]:
@@ -299,19 +299,27 @@ def start(args):
 			use_gpu = args["gpu"]
 			print(f"{procs_cpu=} {procs_gpu=} {use_gpu=}")
 
+			settings = ProcessSettings(False, False, ProcErrorHandling.Log)
+
 			pool = None
 			if use_gpu:
 				print("running on GPU")
 				if procs_gpu > 1:
 					import multiprocessing.dummy as mp
 					pool = mp.Pool(procs_gpu)
-					start_processing_gpu(face_path, fp_todo, True, pool, procs_gpu)
+					settings.load_own_model = True
+					start_processing_gpu_multi(face_path, fp_todo, settings, pool, procs_gpu)
 				else:
-					start_processing_gpu(face_path, fp_todo, False, None, procs_gpu)
+					try:
+						import tqdm
+						fp_todo_use = tqdm.tqdm(fp_todo)
+					except ImportError:
+						fp_todo_use = fp_todo
+					start_processing_gpu_single(face_path, fp_todo_use, settings)
 			else:
 				import multiprocessing as mp
 				pool = mp.Pool(procs_cpu)
-				start_processing_cpu(face_path, fp_todo, False, pool, procs_cpu)
+				start_processing_cpu(face_path, fp_todo, settings, pool, procs_cpu)
 
 			if pool is not None:
 				pool.close()

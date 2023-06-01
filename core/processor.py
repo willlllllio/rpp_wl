@@ -1,14 +1,21 @@
+import builtins
+import dataclasses
 import os
 import traceback
+from enum import Enum
 from pathlib import Path
 
 import cv2
 import insightface
-from core.utils import write_atomic
+from core.utils import write_atomic, ensure
 import core.globals
 
 FACE_SWAPPER = None
 FACE_ANALYSER = None
+
+import logging as _logging
+
+logger = _logging.getLogger(__name__)
 
 
 def get_face_analyser():
@@ -39,21 +46,49 @@ def get_face_swapper():
 	return FACE_SWAPPER
 
 
-def process_video(source_img: Path, frame_paths: list[tuple[Path, Path]], load_own_model: bool, skip_existing: bool):
+class ProcErrorHandling(Enum):
+	Log = 1
+	Ignore = 2
+	Symlink = 3
+	Copy = 4
+	Raise = 5
+
+
+@dataclasses.dataclass
+class ProcessSettings():
+	load_own_model: bool
+	skip_existing: bool
+	error_handling: ProcErrorHandling = ProcErrorHandling.Log
+	progprint = builtins.print
+
+
+def process_video(source_img: Path, frame_paths: list[tuple[Path, Path]], settings: ProcessSettings):
 	source_face = get_face(cv2.imread(str(source_img)))
 	if not frame_paths:
 		return
-
-	if load_own_model:
+	if settings.load_own_model:
 		# needed to run multiple at the same time on the GPU, seems to give better utilization on some
 		swapper = load_face_swapper()
 	else:
 		swapper = get_face_swapper()
 
 	for (src_frame_path, target_frame_path) in frame_paths:
-		res = process_frame(swapper, source_face, src_frame_path, target_frame_path, skip_existing)
+		res = process_frame(swapper, source_face, src_frame_path, target_frame_path, settings.skip_existing)
 		if res:
-			print(res, end = '', flush = True)
+			settings.progprint(res, end = '', flush = True)
+
+		if res not in (".", "R"):
+			error_handling = settings.error_handling
+			if error_handling is ProcErrorHandling.Ignore:
+				continue
+
+			logger.info("processing error %r for file %s, %s", res, src_frame_path, error_handling.name)
+			if error_handling is ProcErrorHandling.Symlink:
+				ensure(not target_frame_path.exists(), c = target_frame_path)
+				os.symlink(src_frame_path.absolute(), target_frame_path.absolute())
+			else:
+				#TODO
+				raise NotImplementedError(error_handling, src_frame_path, target_frame_path)
 
 
 def process_frame(swapper, source_face, src_frame_path: Path, target_frame_path: Path, skip_existing: bool):
