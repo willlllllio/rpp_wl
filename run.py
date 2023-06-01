@@ -277,7 +277,8 @@ def process_streamed(
 	else:
 		gen = _frame_gen_ffmpeg(args, source_path, width, height, fps_use)
 
-	settings = ProcessSettings(True, False, ProcErrorHandling.Copy)
+	noop = lambda *a, **k: None
+	settings = ProcessSettings(True, False, ProcErrorHandling.Copy, noop)
 	gen = process_gen(face_path, gen, settings)
 
 	# try:
