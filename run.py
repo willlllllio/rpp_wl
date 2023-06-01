@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import os
 
 if not os.environ.get("SKIP_EARLY_TORCH") == "1":
@@ -265,9 +267,11 @@ def process_streamed(
 		output_path_plain = output_path
 
 	# Note: cv2 VideoCapture is much faster (almost 2x) but has no way to easily skip frames,
-	# would have to get frame timestamps and implement skipping by hand when using fps_use.
-	# gen = _frame_gen_cv2(source_path)
-	gen = _frame_gen_ffmpeg(args, source_path, width, height, fps_use)
+	# would have to get frame timestamps and implement skipping by hand when using fps_use to always use.
+	if fps_use is None:
+		gen = _frame_gen_cv2(source_path)
+	else:
+		gen = _frame_gen_ffmpeg(args, source_path, width, height, fps_use)
 
 	settings = ProcessSettings(True, False, ProcErrorHandling.Copy)
 	gen = process_gen(face_path, gen, settings)
@@ -282,6 +286,7 @@ def process_streamed(
 	# 		yield i
 	# gen = proc(gen)
 
+	# TODO: option to add audio in one go too in case of no plain file
 	create_video_from_frame_gen(gen, width, height, fps_swapped, output_path_plain)
 	if vid_output_audio:
 		ensure(output_path != output_path_plain)
