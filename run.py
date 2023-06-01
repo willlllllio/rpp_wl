@@ -156,7 +156,7 @@ def makedir(path: str | Path, exist_ok = False, parents: bool | int = False):
 		path.mkdir(exist_ok = exist_ok, parents = True)
 
 
-def output_args_replace(format_str: str, face_path: Path, source_path: Path):
+def output_args_replace(format_str: str, face_path: Path, source_path: Path, args: dict):
 	def rep(match: re.Match):
 		name = match.group(1)
 		if name == "src_bn":
@@ -167,6 +167,10 @@ def output_args_replace(format_str: str, face_path: Path, source_path: Path):
 			return source_path.with_suffix("").name
 		if name == "face_bnc":
 			return face_path.with_suffix("").name
+		if name == "format":
+			return args["format"]
+		if name == "plain_format":
+			return args["plain_format"] or args["format"]
 
 		raise ValueError(f"unsupported format name: {name!r}")
 
@@ -190,17 +194,17 @@ def start(args):
 
 	ensure(not (args["output_vid_formatted"] and args["output_vid"]), c = "got both output_vid_formatted and output_vid")
 	if args["output_vid_formatted"]:
-		args["output_vid"] = _out = output_args_replace(args["output_vid_formatted"], face_path, source_path)
+		args["output_vid"] = _out = output_args_replace(args["output_vid_formatted"], face_path, source_path, args)
 		print(f"using formatted output path: {str(_out)!r}")
 
 	output_path = args["output_vid"]
 	if output_path:
 		output_path = Path(output_path)
 		if output_path.is_dir():
-			output_path = output_path / source_path.with_suffix(".swapped.mp4").name
+			output_path = output_path / source_path.with_suffix(f".swapped.{args['format']}").name
 			print(f"output_path is directory, saving to {str(output_path)!r}")
 	else:
-		output_path = source_path.with_suffix(".swapped.mp4")
+		output_path = source_path.with_suffix(f".swapped.{args['format']}")
 
 	ensure(not output_path.exists(), c = ("output_path exists", output_path))
 
@@ -261,7 +265,7 @@ def process_streamed(
 	width, height = detect_dimensions(source_path, ffprobe = args["ffprobe"])
 
 	if vid_output_audio:
-		output_path_plain = output_path.with_suffix(".plain.mp4")
+		output_path_plain = output_path.with_suffix(".plain." + (args["plain_format"] or args["format"]))
 		ensure(not output_path_plain.exists(), c = ("output_path_plain exists", output_path_plain))
 	else:
 		output_path_plain = output_path
@@ -341,7 +345,7 @@ def process_using_frames(
 
 	output_path_plain = None
 	if args["vid_output_plain"]:
-		output_path_plain = output_path.with_suffix(".plain.mp4")
+		output_path_plain = output_path.with_suffix(".plain." + (args["plain_format"] or args["format"]))
 		ensure(not output_path_plain.exists(), c = ("output_path_plain exists", output_path_plain))
 
 	if source_path.is_file():
@@ -455,10 +459,7 @@ def make_parser():
 	parser.add_argument("-o", "--output_vid", help = "save output to this file")
 	parser.add_argument("-O", "--output_vid_formatted", help = "save output to this file with {} formatting")
 
-	parser.add_argument("--name_suffix_org", default = DEFAULT_FRAME_SUFFIX_ORG,
-						help = "suffix (including extension) of original frame names")
-	parser.add_argument("--name_suffix_swapped", default = DEFAULT_FRAME_SUFFIX_SWAPPED,
-						help = "suffix (including extension) of original frame names")
+	vidcontainer = lambda inp: inp.lstrip(".").strip()
 
 	parser.add_argument("--gpu", action = "store_true",
 						help = "use gpu")
@@ -473,6 +474,14 @@ def make_parser():
 
 	parser.add_argument("--fps_source", type = num_arg,
 						help = "source video fps")
+
+	parser.add_argument("-F", "--format", default = "mp4", type = vidcontainer, help = "video container to use, default mp4")
+	parser.add_argument("--plain_format", type = vidcontainer, help = "video container to use for plain files")
+
+	parser.add_argument("--name_suffix_org", default = DEFAULT_FRAME_SUFFIX_ORG,
+						help = "suffix (including extension) of original frame names")
+	parser.add_argument("--name_suffix_swapped", default = DEFAULT_FRAME_SUFFIX_SWAPPED,
+						help = "suffix (including extension) of original frame names")
 
 	def existing_path(p: str):
 		path = Path(p)
