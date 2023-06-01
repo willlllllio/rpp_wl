@@ -21,7 +21,8 @@ import cv2
 import numpy as np
 
 from core.processor import process_video, process_img, get_face, ProcessSettings, ProcErrorHandling, process_gen
-from core.utils import is_img, detect_fps, create_video, add_audio, extract_frames, ensure, Timer, create_video_with_audio, detect_dimensions, ensure_equal, create_video_from_frame_gen
+from core.utils import is_img, detect_fps, create_video, add_audio, extract_frames, ensure, Timer, create_video_with_audio, detect_dimensions, ensure_equal, create_video_from_frame_gen, \
+	tmp_path_move_ctx
 import psutil
 
 # DEFAULT_FRAME_SUFFIX_ORG = "_org.png"
@@ -257,17 +258,18 @@ def start(args):
 def process_streamed(
 		args: dict, source_path: Path, face_path: Path, workdir: Path,
 		output_path: Path,
-		# fps for frames to take from source, None if using all,
-		fps_use: int | float | None,
-		fps_swapped: int | float,  # fps that will be output, always same as fps_use if that is given
+		fps_use: int | float | None,  # fps to read from source, so drop frames if src fps is higher, None = use all frames.
+		fps_swapped: int | float,  # fps that will be output, always same as fps_use if that isn't None
 ):
 	vid_output_audio: bool = args["vid_output_audio"]
 	width, height = detect_dimensions(source_path, ffprobe = args["ffprobe"])
 
 	if vid_output_audio:
+		# want audio added, create audioless .plain then combine at final output_path
 		output_path_plain = output_path.with_suffix(".plain." + (args["plain_format"] or args["format"]))
 		ensure(not output_path_plain.exists(), c = ("output_path_plain exists", output_path_plain))
 	else:
+		# no audio, can write to final filepath right away
 		output_path_plain = output_path
 
 	# Note: cv2 VideoCapture is much faster (almost 2x) but has no way to easily skip frames,
@@ -281,22 +283,18 @@ def process_streamed(
 	settings = ProcessSettings(True, False, ProcErrorHandling.Copy, noop)
 	gen = process_gen(face_path, gen, settings)
 
-	# try:
-	# 	import tqdm
-	# 	gen = tqdm.tqdm(gen, total = )
-
-	# def proc(gen):
-	# 	for pos, i in enumerate(gen):
-	# 		print(f"swapped #{pos}")
-	# 		yield i
-	# gen = proc(gen)
-
 	# TODO: option to add audio in one go too in case of no plain file
-	create_video_from_frame_gen(gen, width, height, fps_swapped, output_path_plain)
+	# TODO: handle no audio
+	with tmp_path_move_ctx(output_path_plain, trail_org_ext = True) as tmp_path:
+		print(f"{tmp_path=}")
+		create_video_from_frame_gen(gen, width, height, fps_swapped, tmp_path)
+
 	if vid_output_audio:
 		ensure(output_path != output_path_plain)
 		ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info"])
-		add_audio(output_path_plain, source_path, output_path, **ffmpeg)
+		with tmp_path_move_ctx(output_path, trail_org_ext = True) as tmp_path:
+			print(f"{tmp_path=}")
+			add_audio(output_path_plain, source_path, tmp_path, **ffmpeg)
 
 
 def _frame_gen_ffmpeg(args, source_path: Path, width, height, fps_use: int | float | None, ):

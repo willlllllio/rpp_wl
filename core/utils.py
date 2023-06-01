@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import random
@@ -98,6 +99,7 @@ def create_video_from_frame_gen(frame_gen, width: int, height: int, fps: int | f
 
 
 def add_audio(video_path: Path, audio_source_path: Path, target_path: Path, ffmpeg = "ffmpeg", extra_args = None):
+	# TODI: fix timestamps?
 	subprocess.check_output([
 		ffmpeg, "-n", *(extra_args or []),
 		"-i", str(video_path), "-i", str(audio_source_path), "-c:v", "copy", "-map", "0:v:0", "-map", "1:a:0",
@@ -133,6 +135,59 @@ def ensure_equal(left, right, c = None):
 	if left != right:
 		raise ValueError("ensure_equal error, left != right",
 						 type(left), type(right), left, right, c)
+
+
+def _with_ext(path: str | Path, ext: str, keep_org_ext: bool = True, trail_org_ext: bool = False):
+	# not using with_suffix as that would require ext to start with a "."
+	if keep_org_ext:
+		if trail_org_ext:
+			# name.tmp.ext"
+			return path.with_name(path.stem + ext + path.suffix)
+		else:
+			# name.ext.tmp"
+			return path.with_name(path.name + ext)
+	else:
+		# name.tmp
+		return path.with_name(path.stem + ext)
+
+
+@contextlib.contextmanager
+def tmp_path_move_ctx(
+		path: str | Path,
+		tmp_ext: str = ".tmp",
+		keep_org_ext: bool = True,
+		trail_org_ext: bool = False,
+		overwrite: bool = False,
+		move_on_error: bool | str = False,
+		ignore_error: bool = False,
+):
+	ensure(tmp_ext)
+	path = Path(path)
+	if not overwrite and path.exists():
+		raise FileExistsError(path)
+
+	tmp_path = _with_ext(path, tmp_ext, keep_org_ext, trail_org_ext)
+	ensure(path != tmp_path)
+
+	def _move(target: Path):
+		if not overwrite and target.exists():
+			raise FileExistsError(target)
+		os.rename(tmp_path, target)
+
+	try:
+		yield tmp_path
+	except:
+		# TODI: multi exception in case of move error?
+		if move_on_error is True:
+			_move(path)
+		elif isinstance(move_on_error, str):
+			err_path = _with_ext(path, tmp_ext, keep_org_ext, trail_org_ext)
+			_move(err_path)
+
+		if not ignore_error:
+			raise
+	else:
+		_move(path)
 
 
 from typing import Union, Optional, Any, TypeVar
