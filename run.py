@@ -228,8 +228,8 @@ def start(args):
 		fps_src = args["fps_source"]
 		ensure(fps_src, c = ("source_path is png sequence, manually passing --fps_source framerate argument required"))
 
-	fps_target: int = args["fps_target"]
-	if not args['keep_fps'] and fps_src > fps_target:
+	fps_target: int | None = args["fps_target"]
+	if fps_target and fps_src > fps_target:
 		fps_use = fps_target
 		fps_swapped = fps_target
 		print("limiting fps to", fps_use)
@@ -278,7 +278,7 @@ def process_streamed(
 		output_path_plain = output_path
 
 	# Note: cv2 VideoCapture is much faster (almost 2x) but has no way to easily skip frames,
-	# would have to get frame timestamps and implement skipping by hand when using fps_use to always use.
+	# would have to get frame timestamps and implement skipping by hand when using fps_use to always use, or assume constant fps.
 	if fps_use is None:
 		gen = _frame_gen_cv2(source_path)
 	else:
@@ -493,13 +493,10 @@ def make_parser():
 						help = "no frame files just do everything in mem and write directly to plain output file")
 	parser.add_argument("--keep_frames", action = "store_true",
 						help = "keep frames directory")
-	parser.add_argument("--keep_fps", action = "store_true",
-						help = "maintain original fps")
-	parser.add_argument("--fps_target", type = num_arg, default = 30,
-						help = "target fps")
-
+	parser.add_argument("-R", "--fps_target", type = num_arg,
+						help = "maximum source fps wanted, will drop frames if source is higher fps, does nothing if source fps is lower")
 	parser.add_argument("--fps_source", type = num_arg,
-						help = "source video fps")
+						help = "source video fps, only needed for png sequence folder sources or maybe weird file formats")
 
 	vidcontainer = lambda inp: inp.lstrip(".").strip()
 	parser.add_argument("-F", "--format", default = "mp4", type = vidcontainer, help = "video container to use, default mp4")
