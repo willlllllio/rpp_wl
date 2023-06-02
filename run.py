@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import os
+import shlex
 
 if not os.environ.get("SKIP_EARLY_TORCH") == "1":
 	import torch  # needs to be imported before onnx for GPU support to work easily apparently
@@ -257,6 +258,15 @@ def start(args):
 								 fps_use, fps_swapped)
 
 
+def _split_shell_args(args):
+	if not args:
+		return []
+	res = []
+	for i in args:
+		res.extend(shlex.split(i))
+	return res
+
+
 def process_streamed(
 		args: dict, source_path: Path, face_path: Path, workdir: Path,
 		output_path: Path,
@@ -279,7 +289,8 @@ def process_streamed(
 
 	# Note: cv2 VideoCapture is much faster (almost 2x) but has no way to easily skip frames,
 	# would have to get frame timestamps and implement skipping by hand when using fps_use to always use, or assume constant fps.
-	if fps_use is None:
+
+	if args["cv2_reader"] or (args["ffmpeg_reader"] is False and fps_use is None):
 		gen = _frame_gen_cv2(source_path)
 	else:
 		gen = _frame_gen_ffmpeg(args, source_path, width, height, fps_use)
@@ -312,16 +323,18 @@ def process_streamed(
 	# TODO: option to add audio in one go too in case of no plain file
 	# TODO: handle no audio
 
-	ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info"])
 	_tmp_file_ctx = functools.partial(tmp_path_move_ctx, trail_org_ext = True, overwrite = overwrite, overwrite_delete = overwrite)
 	with _tmp_file_ctx(output_path_plain) as tmp_path:
 		print(f"{tmp_path=}")
-		create_video_from_frame_gen(gen, width, height, fps_swapped, tmp_path, **ffmpeg)
+		ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info", *_split_shell_args(args["out_ff_args"])])
+		create_video_from_frame_gen(gen, width, height, fps_swapped, tmp_path, **ffmpeg, preset = args["preset"], crf = args["crf"])
 
 	if vid_output_audio:
 		ensure(output_path != output_path_plain)
 		with _tmp_file_ctx(output_path) as tmp_path:
 			print(f"{tmp_path=}")
+			ffmpeg = dict(ffmpeg = args["ffmpeg"], shortest = args["audio_shortest"],
+						  extra_args = ["-hide_banner", "-loglevel", "info", *_split_shell_args(args["audio_ff_args"])])
 			add_audio(output_path_plain, source_path, tmp_path, **ffmpeg)
 
 
@@ -331,12 +344,17 @@ def _frame_gen_ffmpeg(args, source_path: Path, width, height, fps_use: int | flo
 	img_size = width * height * 3
 	ffmpeg = [args["ffmpeg"], "-hide_banner", "-loglevel", "info"]
 	fps = ["-filter:v", f"fps=fps={fps_use}"] if fps_use else []
+
 	com = [
 		*ffmpeg,
+		*_split_shell_args(args["ffmpeg_reader_args_0"]),
 		"-i", str(source_path),
+		*_split_shell_args(args["ffmpeg_reader_args_1"]),
 		*fps,
-		"-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:"
+		"-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:",
+		*_split_shell_args(args["ffmpeg_reader_args_2"]),
 	]
+	print("com", repr(com))
 	proc = subprocess.Popen(com, stdout = subprocess.PIPE, bufsize = 128 * 1024 ** 2)
 	while True:
 		buffer = proc.stdout.read(img_size)
@@ -493,10 +511,34 @@ def make_parser():
 						help = "no frame files just do everything in mem and write directly to plain output file")
 	parser.add_argument("--keep_frames", action = "store_true",
 						help = "keep frames directory")
-	parser.add_argument("-R", "--fps_target", type = num_arg,
+	parser.add_argument("-r", "--fps_target", type = num_arg,
 						help = "maximum source fps wanted, will drop frames if source is higher fps, does nothing if source fps is lower")
 	parser.add_argument("--fps_source", type = num_arg,
 						help = "source video fps, only needed for png sequence folder sources or maybe weird file formats")
+
+	parser.add_argument("--crf", type = int, default = 14,
+						help = "output crf")
+	parser.add_argument("--preset", default = "superfast",
+						help = "output preset")
+	parser.add_argument("--out_ff_args", action = "append",
+						help = "extra output ffmpeg args")
+	parser.add_argument("--audio_ff_args", action = "append",
+						help = "extra audio merging ffmpeg args")
+
+	parser.add_argument("--audio_shortest", action = "store_true",
+						help = "shorten audio file to vid length, should only be needed if seeking with -XYZ")
+
+	parser.add_argument("-R", "--ffmpeg_reader", action = "store_true",
+						help = "always use ffmpeg source reader")
+	parser.add_argument("--cv2_reader", action = "store_true",
+						help = "always use opencv source reader")
+
+	parser.add_argument("-X", "--ffmpeg_reader_args_0", action = "append",
+						help = "arguments passed to ffmpeg reader in front of args. Note: add space in front if it starts with -")
+	parser.add_argument("-Y", "--ffmpeg_reader_args_1", action = "append",
+						help = "arguments passed to ffmpeg reader after input. Note: add space in front if it starts with -")
+	parser.add_argument("-Z", "--ffmpeg_reader_args_2", action = "append",
+						help = "arguments passed to ffmpeg reader after output. Note: add space in front if it starts with -")
 
 	vidcontainer = lambda inp: inp.lstrip(".").strip()
 	parser.add_argument("-F", "--format", default = "mp4", type = vidcontainer, help = "video container to use, default mp4")

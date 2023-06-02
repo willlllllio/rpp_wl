@@ -82,11 +82,15 @@ def create_video(frames_dir: Path, fps: int | float, target: Path, filename_patt
 
 
 def create_video_from_frame_gen(frame_gen, width: int, height: int, fps: int | float, target: Path, ffmpeg = "ffmpeg", extra_args = None,
-								finish_timeout = 10, check = True):
+								finish_timeout = 10, check = True, crf: int | None = None, preset: str | None = None):
+
+	preset = ["-preset", preset] if preset else []
+	crf = ["-crf", str(crf)] if crf else []
+
 	proc = subprocess.Popen([
 		ffmpeg, "-n", *(extra_args or []),
 		'-f', 'rawvideo', "-pix_fmt", "bgr24", "-video_size", f"{width}x{height}", "-framerate", str(fps), '-i', '-',
-		"-c:v", "libx264", "-crf", "7", "-pix_fmt", "yuv420p", "-r", str(fps), str(target),
+		"-c:v", "libx264", *preset, *crf, "-pix_fmt", "yuv420p", "-r", str(fps), str(target),
 	],
 		stdin = subprocess.PIPE
 	)
@@ -100,11 +104,14 @@ def create_video_from_frame_gen(frame_gen, width: int, height: int, fps: int | f
 		ensure(exitcode == 0)
 
 
-def add_audio(video_path: Path, audio_source_path: Path, target_path: Path, ffmpeg = "ffmpeg", extra_args = None):
+def add_audio(video_path: Path, audio_source_path: Path, target_path: Path, ffmpeg = "ffmpeg", extra_args = None, shortest = False):
 	# TODI: fix timestamps?
 	subprocess.check_output([
 		ffmpeg, "-n", *(extra_args or []),
-		"-i", str(video_path), "-i", str(audio_source_path), "-c:v", "copy", "-map", "0:v:0", "-map", "1:a:0",
+		"-i", str(video_path),
+		"-i", str(audio_source_path),
+		*(["-shortest"] if shortest else []),
+		"-c:v", "copy", "-map", "0:v:0", "-map", "1:a:0",
 		str(target_path)
 	])
 
@@ -113,7 +120,8 @@ def create_video_with_audio(frames_dir: Path, fps: int | float, audio_source_pat
 							filename_pattern = "%05d.png", ffmpeg = "ffmpeg", extra_args = None):
 	subprocess.check_output([
 		ffmpeg, "-n", *(extra_args or []),
-		"-framerate", str(fps), "-i", frames_dir / filename_pattern,
+		"-framerate", str(fps),
+		"-i", frames_dir / filename_pattern,
 		"-i", str(audio_source_path),
 		"-c:v", "libx264", "-crf", "7", "-pix_fmt", "yuv420p",
 		"-map", "0:v:0", "-map", "1:a:0",
