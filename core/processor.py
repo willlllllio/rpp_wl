@@ -68,7 +68,7 @@ class ProcessSettings():
 		self.progprint(status, end = "", flush = True)
 
 
-def process_video(source_img: Path, frame_paths: list[tuple[Path, Path]], settings: ProcessSettings):
+def process_video(settings: ProcessSettings, source_img: Path, frame_paths: list[tuple[Path, Path]]):
 	source_face = get_face(cv2.imread(str(source_img)))
 	if not frame_paths:
 		return
@@ -109,8 +109,8 @@ def process_video(source_img: Path, frame_paths: list[tuple[Path, Path]], settin
 				raise NotImplementedError(error_handling, src_frame_path, target_frame_path)  # TODO
 
 
-def process_gen(source_img: Path, frame_gen, settings: ProcessSettings):
-	source_face = get_face(cv2.imread(str(source_img)))
+def _setup(settings: ProcessSettings, face_img: Path):
+	face = get_face(cv2.imread(str(face_img)))
 
 	if settings.load_own_model:
 		# needed to run multiple at the same time on the GPU, seems to give better utilization on some
@@ -118,22 +118,54 @@ def process_gen(source_img: Path, frame_gen, settings: ProcessSettings):
 	else:
 		swapper = get_face_swapper()
 
-	for pos, src_frame in enumerate(frame_gen):
-		res = process_frame(swapper, source_face, src_frame)
-		if not isinstance(res, str):
-			settings.progress(".")
-			yield res
-		else:
-			settings.progress(res)
-			error_handling = settings.error_handling
-			if error_handling is ProcErrorHandling.Ignore:
-				continue
+	return settings, swapper, face
 
-			logger.info("processing error %r for frame %s, %s", res, pos, error_handling.name)
-			if error_handling is ProcErrorHandling.Copy:
-				yield src_frame
-			else:
-				raise NotImplementedError(res, error_handling, pos)  # TODO
+
+def process_gen(settings: ProcessSettings, face_img: Path, frame_gen):
+	state = _setup(settings, face_img)
+	for pos, src_frame in enumerate(frame_gen):
+		res = process_gen_frame(*state, src_frame, pos)
+		if res is not None:
+			yield res
+
+
+def process_gen_frame(settings, swapper, face, src_frame, pos = None):
+	res = process_frame(swapper, face, src_frame)
+	if not isinstance(res, str):
+		settings.progress(".")
+		return res
+	else:
+		settings.progress(res)
+		error_handling = settings.error_handling
+		if error_handling is ProcErrorHandling.Ignore:
+			return
+
+		logger.info("processing error %r for frame #%s, %s", res, pos, error_handling.name)
+		if error_handling is ProcErrorHandling.Copy:
+			return src_frame
+		else:
+			raise NotImplementedError(res, error_handling, pos)  # TODO
+
+
+_gen_state = None
+
+
+def _init_gen_state_global(settings: ProcessSettings, source_img: Path):
+	# print("_init_gen_state_global", os.getpid(), os.getppid())
+	global _gen_state
+	ensure(_gen_state is None)
+	_gen_state = _setup(settings, source_img)
+	return _gen_state
+
+
+def process_gen_frame_global(tup, pos = None):
+	global _gen_state
+
+	settings, source_img, src_frame = tup
+	if _gen_state is None:
+		_init_gen_state_global(settings, source_img)
+
+	return process_gen_frame(*_gen_state, src_frame, pos)
 
 
 def process_frame(swapper, source_face, frame):

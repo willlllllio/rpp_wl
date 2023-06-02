@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 
 if not os.environ.get("SKIP_EARLY_TORCH") == "1":
@@ -20,9 +21,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from core.processor import process_video, process_img, get_face, ProcessSettings, ProcErrorHandling, process_gen
+from core.processor import process_video, process_img, get_face, ProcessSettings, ProcErrorHandling, process_gen, _init_gen_state_global, process_gen_frame_global
 from core.utils import is_img, detect_fps, create_video, add_audio, extract_frames, ensure, Timer, create_video_with_audio, detect_dimensions, ensure_equal, create_video_from_frame_gen, \
-	tmp_path_move_ctx
+	tmp_path_move_ctx, noop
 import psutil
 
 # DEFAULT_FRAME_SUFFIX_ORG = "_org.png"
@@ -102,7 +103,7 @@ def start_processing_cpu(face_img: Path, frame_paths: list[tuple[Path, Path]], s
 	n = max(len(frame_paths) // procnum, 1)
 	processes = []
 	for i in range(0, len(frame_paths), n):
-		p = pool.apply_async(process_video, args = (face_img, frame_paths[i:i + n], settings))
+		p = pool.apply_async(process_video, args = (settings, face_img, frame_paths[i:i + n]))
 		processes.append(p)
 
 	for p in processes:
@@ -114,7 +115,7 @@ def start_processing_gpu_multi(face_img: Path, frame_paths: list[tuple[Path, Pat
 
 
 def start_processing_gpu_single(face_img: Path, frame_paths: list[tuple[Path, Path]], settings: ProcessSettings):
-	process_video(face_img, frame_paths, settings)
+	process_video(settings, face_img, frame_paths)
 
 
 def status(string):
@@ -207,7 +208,8 @@ def start(args):
 	else:
 		output_path = source_path.with_suffix(f".swapped.{args['format']}")
 
-	ensure(not output_path.exists(), c = ("output_path exists", output_path))
+	if not args["overwrite"]:
+		ensure(not output_path.exists(), c = ("output_path exists", output_path))
 
 	with Timer("setgrad took {:.2f} secs"):
 		import torch
@@ -220,7 +222,7 @@ def start(args):
 			return
 
 		status("detecting video's FPS...")
-		fps_src = args["fps_source"] if args["fps_source"] is not None else detect_fps(source_path)
+		fps_src = args["fps_source"] if args["fps_source"] is not None else detect_fps(source_path, ffprobe = args["ffprobe"])
 		print("fps_src", fps_src)
 	else:
 		fps_src = args["fps_source"]
@@ -262,12 +264,15 @@ def process_streamed(
 		fps_swapped: int | float,  # fps that will be output, always same as fps_use if that isn't None
 ):
 	vid_output_audio: bool = args["vid_output_audio"]
+	overwrite = args["overwrite"]
+
 	width, height = detect_dimensions(source_path, ffprobe = args["ffprobe"])
 
 	if vid_output_audio:
 		# want audio added, create audioless .plain then combine at final output_path
 		output_path_plain = output_path.with_suffix(".plain." + (args["plain_format"] or args["format"]))
-		ensure(not output_path_plain.exists(), c = ("output_path_plain exists", output_path_plain))
+		if not overwrite:
+			ensure(not output_path_plain.exists(), c = ("output_path_plain exists", output_path_plain))
 	else:
 		# no audio, can write to final filepath right away
 		output_path_plain = output_path
@@ -279,20 +284,43 @@ def process_streamed(
 	else:
 		gen = _frame_gen_ffmpeg(args, source_path, width, height, fps_use)
 
-	noop = lambda *a, **k: None
 	settings = ProcessSettings(True, False, ProcErrorHandling.Copy, noop)
-	gen = process_gen(face_path, gen, settings)
+
+	procs_cpu = args["parallel_cpu"]
+	procs_gpu = args["parallel_gpu"]
+	use_gpu = args["gpu"]
+	procs = procs_gpu if use_gpu else procs_cpu
+	print(f"{procs_cpu=} {procs_gpu=} {use_gpu=}")
+	if procs > 1:
+		if not use_gpu:
+			import multiprocessing as mp
+		else:
+			import multiprocessing.dummy as mp
+			_init_gen_state_global(settings, face_path)
+
+		pool = mp.Pool(procs)
+
+		def _settings_gen(gen):
+			for i in gen:
+				yield settings, face_path, i
+
+		gen = _settings_gen(gen)
+		gen = pool.imap(process_gen_frame_global, gen)
+	else:
+		gen = process_gen(settings, face_path, gen)
 
 	# TODO: option to add audio in one go too in case of no plain file
 	# TODO: handle no audio
-	with tmp_path_move_ctx(output_path_plain, trail_org_ext = True) as tmp_path:
+
+	ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info"])
+	_tmp_file_ctx = functools.partial(tmp_path_move_ctx, trail_org_ext = True, overwrite = overwrite, overwrite_delete = overwrite)
+	with _tmp_file_ctx(output_path_plain) as tmp_path:
 		print(f"{tmp_path=}")
-		create_video_from_frame_gen(gen, width, height, fps_swapped, tmp_path)
+		create_video_from_frame_gen(gen, width, height, fps_swapped, tmp_path, **ffmpeg)
 
 	if vid_output_audio:
 		ensure(output_path != output_path_plain)
-		ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info"])
-		with tmp_path_move_ctx(output_path, trail_org_ext = True) as tmp_path:
+		with _tmp_file_ctx(output_path) as tmp_path:
 			print(f"{tmp_path=}")
 			add_audio(output_path_plain, source_path, tmp_path, **ffmpeg)
 
@@ -458,8 +486,7 @@ def make_parser():
 	parser.add_argument("-o", "--output_vid", help = "save output to this file")
 	parser.add_argument("-O", "--output_vid_formatted", help = "save output to this file with {} formatting")
 
-	vidcontainer = lambda inp: inp.lstrip(".").strip()
-
+	parser.add_argument("-y", "--overwrite", action = "store_true", help = "save output to this file with {} formatting")
 	parser.add_argument("--gpu", action = "store_true",
 						help = "use gpu")
 	parser.add_argument("--stream", action = "store_true",
@@ -474,6 +501,7 @@ def make_parser():
 	parser.add_argument("--fps_source", type = num_arg,
 						help = "source video fps")
 
+	vidcontainer = lambda inp: inp.lstrip(".").strip()
 	parser.add_argument("-F", "--format", default = "mp4", type = vidcontainer, help = "video container to use, default mp4")
 	parser.add_argument("--plain_format", type = vidcontainer, help = "video container to use for plain files")
 

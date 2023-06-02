@@ -82,7 +82,7 @@ def create_video(frames_dir: Path, fps: int | float, target: Path, filename_patt
 
 
 def create_video_from_frame_gen(frame_gen, width: int, height: int, fps: int | float, target: Path, ffmpeg = "ffmpeg", extra_args = None,
-								finish_timeout = 10):
+								finish_timeout = 10, check = True):
 	proc = subprocess.Popen([
 		ffmpeg, "-n", *(extra_args or []),
 		'-f', 'rawvideo', "-pix_fmt", "bgr24", "-video_size", f"{width}x{height}", "-framerate", str(fps), '-i', '-',
@@ -95,7 +95,9 @@ def create_video_from_frame_gen(frame_gen, width: int, height: int, fps: int | f
 		proc.stdin.write(frame_buf)
 
 	proc.stdin.close()
-	proc.wait(finish_timeout)
+	exitcode = proc.wait(finish_timeout)
+	if check:
+		ensure(exitcode == 0)
 
 
 def add_audio(video_path: Path, audio_source_path: Path, target_path: Path, ffmpeg = "ffmpeg", extra_args = None):
@@ -117,6 +119,10 @@ def create_video_with_audio(frames_dir: Path, fps: int | float, audio_source_pat
 		"-map", "0:v:0", "-map", "1:a:0",
 		str(target)
 	])
+
+
+def noop(*args, **kwargs):
+	pass
 
 
 def is_img(path):
@@ -158,16 +164,26 @@ def tmp_path_move_ctx(
 		keep_org_ext: bool = True,
 		trail_org_ext: bool = False,
 		overwrite: bool = False,
+		overwrite_delete: bool = False,
+		overwrite_delete_path: bool = False,
+		overwrite_delete_tmp: bool = False,
 		move_on_error: bool | str = False,
 		ignore_error: bool = False,
 ):
 	ensure(tmp_ext)
 	path = Path(path)
-	if not overwrite and path.exists():
-		raise FileExistsError(path)
 
 	tmp_path = _with_ext(path, tmp_ext, keep_org_ext, trail_org_ext)
 	ensure(path != tmp_path)
+
+	if not overwrite and path.exists():
+		raise FileExistsError(path)
+
+	if overwrite and (overwrite_delete or overwrite_delete_path) and path.exists():
+		path.unlink(False)
+
+	if overwrite and (overwrite_delete or overwrite_delete_tmp) and tmp_path.exists():
+		tmp_path.unlink(False)
 
 	def _move(target: Path):
 		if not overwrite and target.exists():
