@@ -200,32 +200,35 @@ def start(args):
 		args["output_vid"] = _out = output_args_replace(args["output_vid_formatted"], face_path, source_path, args)
 		print(f"using formatted output path: {str(_out)!r}")
 
+	source_is_image = source_path.is_file() and is_img(source_path)
+
 	output_path = args["output_vid"]
+	_default_format = args["img_format"] if source_is_image else args["format"]
 	if output_path:
 		output_path = Path(output_path)
 		if output_path.is_dir():
-			output_path = output_path / source_path.with_suffix(f".swapped.{args['format']}").name
+			output_path = output_path / source_path.with_suffix(f".swapped.{_default_format}").name
 			print(f"output_path is directory, saving to {str(output_path)!r}")
 	else:
-		output_path = source_path.with_suffix(f".swapped.{args['format']}")
+		output_path = source_path.with_suffix(f".swapped.{_default_format}")
+	print(f"saving to {str(output_path)!r}")
 
 	if not args["overwrite"]:
 		ensure(not output_path.exists(), c = ("output_path exists", output_path))
 
-	with Timer("setgrad took {:.2f} secs"):
-		import torch
-		torch.set_grad_enabled(False)
-
 	if source_path.is_file():
 		if is_img(source_path):
-			process_img(face_path, source_path, output_path)
+			process_img(face_path, source_path, output_path, args["overwrite"])
 			status("swap successful!")
 			return
-
 		vid_info = get_video_info(source_path, ffprobe = args["ffprobe"])
 	else:
 		vid_info = VidInfo(0, 0, args["fps_source"], False)
 		ensure(vid_info.fps, c = ("source_path is png sequence, manually passing --fps_source framerate argument required"))
+
+	with Timer("setgrad took {:.2f} secs"):
+		import torch
+		torch.set_grad_enabled(False)
 
 	fps_target: int | None = args["fps_target"]
 	if fps_target and vid_info.fps > fps_target:
@@ -537,9 +540,10 @@ def make_parser():
 	parser.add_argument("-Z", "--ffmpeg_reader_args_2", action = "append",
 						help = "arguments passed to ffmpeg reader after output. Note: add space in front if it starts with -")
 
-	vidcontainer = lambda inp: inp.lstrip(".").strip()
-	parser.add_argument("-F", "--format", default = "mp4", type = vidcontainer, help = "video container to use, default mp4")
-	parser.add_argument("--plain_format", type = vidcontainer, help = "video container to use for plain files")
+	formatarg = lambda inp: inp.lstrip(".").strip()
+	parser.add_argument("-F", "--format", default = "mp4", type = formatarg, help = "video container to use, default: mp4")
+	parser.add_argument("-I", "--img_format", default = "png", type = formatarg, help = "image container to use, default: png")
+	parser.add_argument("--plain_format", type = formatarg, help = "video container to use for plain files")
 
 	parser.add_argument("--name_suffix_org", default = DEFAULT_FRAME_SUFFIX_ORG,
 						help = "suffix (including extension) of original frame names")

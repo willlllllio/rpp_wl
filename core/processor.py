@@ -185,7 +185,7 @@ def process_frame(swapper, source_face, frame):
 		return "E"
 
 
-def process_img(source_img: Path, frame_path: Path, output_file: Path):
+def process_img(source_img: Path, frame_path: Path, output_file: Path, may_exist: bool = False):
 	source_face = get_face(cv2.imread(str(source_img)))
 	swapper = load_face_swapper()
 
@@ -196,4 +196,4 @@ def process_img(source_img: Path, frame_path: Path, output_file: Path):
 	is_ok, buffer = cv2.imencode(".png", result)
 	if not is_ok:
 		raise ValueError("failed encoding image??")
-	write_atomic(buffer, output_file, may_exist = False)
+	write_atomic(buffer, output_file, may_exist = may_exist)
