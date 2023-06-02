@@ -23,8 +23,8 @@ import cv2
 import numpy as np
 
 from core.processor import process_video, process_img, get_face, ProcessSettings, ProcErrorHandling, process_gen, _init_gen_state_global, process_gen_frame_global
-from core.utils import is_img, detect_fps, create_video, add_audio, extract_frames, ensure, Timer, create_video_with_audio, detect_dimensions, ensure_equal, create_video_from_frame_gen, \
-	tmp_path_move_ctx, noop
+from core.utils import is_img, create_video, add_audio, extract_frames, ensure, Timer, create_video_with_audio, ensure_equal, create_video_from_frame_gen, \
+	tmp_path_move_ctx, noop, str_to_num, get_video_info, VidInfo
 import psutil
 
 # DEFAULT_FRAME_SUFFIX_ORG = "_org.png"
@@ -222,22 +222,19 @@ def start(args):
 			status("swap successful!")
 			return
 
-		status("detecting video's FPS...")
-		fps_src = args["fps_source"] if args["fps_source"] is not None else detect_fps(source_path, ffprobe = args["ffprobe"])
-		print("fps_src", fps_src)
+		vid_info = get_video_info(source_path, ffprobe = args["ffprobe"])
 	else:
-		fps_src = args["fps_source"]
-		ensure(fps_src, c = ("source_path is png sequence, manually passing --fps_source framerate argument required"))
+		vid_info = VidInfo(0, 0, args["fps_source"], False)
+		ensure(vid_info.fps, c = ("source_path is png sequence, manually passing --fps_source framerate argument required"))
 
 	fps_target: int | None = args["fps_target"]
-	if fps_target and fps_src > fps_target:
+	if fps_target and vid_info.fps > fps_target:
 		fps_use = fps_target
 		fps_swapped = fps_target
 		print("limiting fps to", fps_use)
 	else:
-		# 	shutil.copy(source_path, output_dir)
 		fps_use = None
-		fps_swapped = fps_src
+		fps_swapped = vid_info.fps
 
 	if args["work_dir"]:
 		workdir = Path(args["work_dir"])
@@ -251,11 +248,9 @@ def start(args):
 	with Timer("full processing took {:.4f} secs"):
 		if stream:
 			ensure(not source_path.is_dir(), c = "directory sources not implemented for stream")
-			process_streamed(args, source_path, face_path, workdir, output_path,
-							 fps_use, fps_swapped)
+			process_streamed(args, source_path, face_path, workdir, output_path, vid_info, fps_use, fps_swapped)
 		else:
-			process_using_frames(args, source_path, face_path, workdir, output_path,
-								 fps_use, fps_swapped)
+			process_using_frames(args, source_path, face_path, workdir, output_path, fps_use, fps_swapped)
 
 
 def _split_shell_args(args):
@@ -269,31 +264,20 @@ def _split_shell_args(args):
 
 def process_streamed(
 		args: dict, source_path: Path, face_path: Path, workdir: Path,
-		output_path: Path,
-		fps_use: int | float | None,  # fps to read from source, so drop frames if src fps is higher, None = use all frames.
+		output_path: Path, vid_info: VidInfo,
+		src_fps_output_max: int | float | None,  # fps to read from source, so drop frames if src fps is higher, None = use all frames.
 		fps_swapped: int | float,  # fps that will be output, always same as fps_use if that isn't None
 ):
 	vid_output_audio: bool = args["vid_output_audio"]
 	overwrite = args["overwrite"]
 
-	width, height = detect_dimensions(source_path, ffprobe = args["ffprobe"])
-
-	if vid_output_audio:
-		# want audio added, create audioless .plain then combine at final output_path
-		output_path_plain = output_path.with_suffix(".plain." + (args["plain_format"] or args["format"]))
-		if not overwrite:
-			ensure(not output_path_plain.exists(), c = ("output_path_plain exists", output_path_plain))
-	else:
-		# no audio, can write to final filepath right away
-		output_path_plain = output_path
-
 	# Note: cv2 VideoCapture is much faster (almost 2x) but has no way to easily skip frames,
 	# would have to get frame timestamps and implement skipping by hand when using fps_use to always use, or assume constant fps.
 
-	if args["cv2_reader"] or (args["ffmpeg_reader"] is False and fps_use is None):
+	if args["cv2_reader"] or (args["ffmpeg_reader"] is False and src_fps_output_max is None):
 		gen = _frame_gen_cv2(source_path)
 	else:
-		gen = _frame_gen_ffmpeg(args, source_path, width, height, fps_use)
+		gen = _frame_gen_ffmpeg(args, source_path, vid_info.width, vid_info.height, src_fps_output_max)
 
 	settings = ProcessSettings(True, False, ProcErrorHandling.Copy, noop)
 
@@ -307,6 +291,9 @@ def process_streamed(
 			import multiprocessing as mp
 		else:
 			import multiprocessing.dummy as mp
+			# Multiple parallel runs on GPU, can do just with threads.
+			# init here since the init later isn't threadsafe and might be done multiple times unnecessarily,
+			# not an issue with actual multiprocess.
 			_init_gen_state_global(settings, face_path)
 
 		pool = mp.Pool(procs)
@@ -320,30 +307,45 @@ def process_streamed(
 	else:
 		gen = process_gen(settings, face_path, gen)
 
-	# TODO: option to add audio in one go too in case of no plain file
-	# TODO: handle no audio
-
 	_tmp_file_ctx = functools.partial(tmp_path_move_ctx, trail_org_ext = True, overwrite = overwrite, overwrite_delete = overwrite)
-	with _tmp_file_ctx(output_path_plain) as tmp_path:
-		print(f"{tmp_path=}")
+
+	audio_source_path = None
+	if args["direct_audio"] and vid_info.has_audio:
+		output_path_gen = output_path
+		audio_2stage = False
+		audio_source_path = source_path
+	else:
+		audio_2stage = vid_output_audio and vid_info.has_audio
+		if audio_2stage:
+			# want audio added, create audioless .plain then combine at final output_path
+			output_path_gen = output_path.with_suffix(".plain." + (args["plain_format"] or args["format"]))
+			if not overwrite:
+				ensure(not output_path_gen.exists(), c = ("output_path_gen exists", output_path_gen))
+		else:
+			# no audio, can write to final filepath right away
+			output_path_gen = output_path
+
+	with _tmp_file_ctx(output_path_gen) as tmp_path:
 		ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info", *_split_shell_args(args["out_ff_args"])])
-		create_video_from_frame_gen(gen, width, height, fps_swapped, tmp_path, **ffmpeg, preset = args["preset"], crf = args["crf"])
+		create_video_from_frame_gen(
+			gen, vid_info.width, vid_info.height, fps_swapped, tmp_path,
+			preset = args["preset"], crf = args["crf"], audio_source_path = audio_source_path, audio_shortest = args["audio_shortest"],
+			**ffmpeg,
+		)
 
-	if vid_output_audio:
-		ensure(output_path != output_path_plain)
+	if audio_2stage:
+		ensure(output_path != output_path_gen)
 		with _tmp_file_ctx(output_path) as tmp_path:
-			print(f"{tmp_path=}")
-			ffmpeg = dict(ffmpeg = args["ffmpeg"], shortest = args["audio_shortest"],
-						  extra_args = ["-hide_banner", "-loglevel", "info", *_split_shell_args(args["audio_ff_args"])])
-			add_audio(output_path_plain, source_path, tmp_path, **ffmpeg)
+			ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info", *_split_shell_args(args["audio_ff_args"])])
+			add_audio(output_path_gen, source_path, tmp_path, shortest = args["audio_shortest"], **ffmpeg)
 
 
-def _frame_gen_ffmpeg(args, source_path: Path, width, height, fps_use: int | float | None, ):
+def _frame_gen_ffmpeg(args, source_path: Path, width, height, fps_to_output: int | float | None, ):
 	ensure(width and height, c = (width, height))
 
 	img_size = width * height * 3
 	ffmpeg = [args["ffmpeg"], "-hide_banner", "-loglevel", "info"]
-	fps = ["-filter:v", f"fps=fps={fps_use}"] if fps_use else []
+	fps = ["-filter:v", f"fps=fps={fps_to_output}"] if fps_to_output else []
 
 	com = [
 		*ffmpeg,
@@ -493,11 +495,6 @@ def process_using_frames(
 
 
 def make_parser():
-	def num_arg(num: str):
-		if "." in num or "e" in num:
-			return float(num)
-		return int(num)
-
 	parser = argparse.ArgumentParser()
 	parser.add_argument("-f", "--face", help = "use this face")
 	parser.add_argument("-s", "--source_vid", help = "replace this face")
@@ -511,9 +508,9 @@ def make_parser():
 						help = "no frame files just do everything in mem and write directly to plain output file")
 	parser.add_argument("--keep_frames", action = "store_true",
 						help = "keep frames directory")
-	parser.add_argument("-r", "--fps_target", type = num_arg,
+	parser.add_argument("-r", "--fps_target", type = str_to_num,
 						help = "maximum source fps wanted, will drop frames if source is higher fps, does nothing if source fps is lower")
-	parser.add_argument("--fps_source", type = num_arg,
+	parser.add_argument("--fps_source", type = str_to_num,
 						help = "source video fps, only needed for png sequence folder sources or maybe weird file formats")
 
 	parser.add_argument("--crf", type = int, default = 14,
@@ -571,6 +568,8 @@ def make_parser():
 						help = "dont try to copy audio from source")
 	parser.add_argument("-P", "--no_plain", dest = "vid_output_plain", action = "store_false",
 						help = "dont create plaint output video (.plain.mp4 file without original audio)")
+	parser.add_argument("-d", "--direct_audio", action = "store_true",
+						help = "add audio directly to output file in one go (instead of plain file and then 2nd separate file with audio merged in)")
 
 	parser.add_argument("-S", "--redo_swapped", action = "store_true",
 						help = "always redo any already swapped images")

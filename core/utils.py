@@ -2,12 +2,22 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import json
 import os
 import random
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from typing import Union, Optional, Any, TypeVar
+from collections.abc import Iterable, Collection, Sequence, Callable, Generator, AsyncGenerator
+
+
+def str_to_num(num: str) -> int | float:
+	if "." in num or "e" in num:
+		return float(num)
+	return int(num)
 
 
 def run_command(command, mode = "silent"):
@@ -16,27 +26,38 @@ def run_command(command, mode = "silent"):
 	return os.popen(command).read()
 
 
-def detect_fps(input_path, ffprobe = "ffprobe"):
-	output = subprocess.check_output([
-		ffprobe, "-v", "error", "-select_streams", "v", "-of", "default=noprint_wrappers=1:nokey=1",
-		"-show_entries", "stream=r_frame_rate", str(input_path)])
-
-	output = output.decode()
-	try:
-		return int(output.split("/")[0]) // int(output.split("/")[1])
-	except:
-		raise ValueError("couldn't get fps", output)
+@dataclass
+class VidInfo():
+	width: int
+	height: int
+	fps: int | float
+	has_audio: bool
 
 
-def detect_dimensions(input_path: Path, ffprobe = "ffprobe"):
-	output = subprocess.check_output([
-		ffprobe, "-v", "error", "-select_streams", "v", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x",
-		str(input_path)]
-	)
+def get_video_info(vid_path: str | Path, ffprobe = "ffprobe"):
+	obj = subprocess.check_output([
+		ffprobe, '-v', 'error', '-show_entries', 'stream=width,height,r_frame_rate,codec_type',
+		str(vid_path), '-of', 'default=noprint_wrappers=1', '-print_format', 'json'])
+	obj = json.loads(obj)
+	streams = obj["streams"]
+	by_type = { }
+	for i in streams:
+		by_type.setdefault(i["codec_type"], []).append(i)
 
-	output = output.decode()
-	w, h = output.strip().split("x")
-	return int(w), int(h)
+	vid_streams = by_type.get("video")
+	ensure(vid_streams, c = obj)
+	ensure(len(vid_streams) == 1, c = ("expected 1 video stream, got multiple", len(vid_streams), vid_streams))
+
+	vid = vid_streams[0]
+	width, height = vid["width"], vid["height"]
+	ensure(width and isinstance(width, int), c = repr(width))
+	ensure(height and isinstance(height, int), c = repr(height))
+
+	a, b = map(str_to_num, vid["r_frame_rate"].split("/"))
+	fps = str_to_num(a) / str_to_num(b) if b != 1 else a
+
+	audio = by_type.get("audio")
+	return VidInfo(width, height, fps, bool(audio))
 
 
 def make_temp_name():
@@ -81,16 +102,30 @@ def create_video(frames_dir: Path, fps: int | float, target: Path, filename_patt
 	])
 
 
-def create_video_from_frame_gen(frame_gen, width: int, height: int, fps: int | float, target: Path, ffmpeg = "ffmpeg", extra_args = None,
-								finish_timeout = 10, check = True, crf: int | None = None, preset: str | None = None):
+def create_video_from_frame_gen(
+		frame_gen: Iterable[bytes], width: int, height: int, fps: int | float, target: Path,
+		audio_source_path: Path | str | None = None, audio_shortest: bool = False,
+		finish_timeout = 10, check = True, crf: int | None = None, preset: str | None = None,
+		ffmpeg = "ffmpeg", extra_args = None,
+):
 
 	preset = ["-preset", preset] if preset else []
 	crf = ["-crf", str(crf)] if crf else []
 
+	audio = []
+	if audio_source_path is not None:
+		audio = [
+			"-i", str(audio_source_path),
+			*(["-shortest"] if audio_shortest else []),
+			"-map", "0:v:0", "-map", "1:a:0",
+		]
+
 	proc = subprocess.Popen([
 		ffmpeg, "-n", *(extra_args or []),
 		'-f', 'rawvideo', "-pix_fmt", "bgr24", "-video_size", f"{width}x{height}", "-framerate", str(fps), '-i', '-',
-		"-c:v", "libx264", *preset, *crf, "-pix_fmt", "yuv420p", "-r", str(fps), str(target),
+		*audio,
+		"-c:v", "libx264", *preset, *crf, "-pix_fmt", "yuv420p", "-r", str(fps),
+		str(target),
 	],
 		stdin = subprocess.PIPE
 	)
@@ -212,10 +247,6 @@ def tmp_path_move_ctx(
 			raise
 	else:
 		_move(path)
-
-
-from typing import Union, Optional, Any, TypeVar
-from collections.abc import Iterable, Collection, Sequence, Callable, Generator, AsyncGenerator
 
 
 class Timer():
