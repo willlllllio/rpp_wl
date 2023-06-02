@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import builtins
 import dataclasses
+import functools
 import os
 import traceback
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import cv2
 import insightface
-from core.utils import write_atomic, ensure
+from core.utils import write_atomic, ensure, noop
 import core.globals
 
 FACE_SWAPPER = None
@@ -68,47 +69,6 @@ class ProcessSettings():
 		self.progprint(status, end = "", flush = True)
 
 
-def process_video(settings: ProcessSettings, source_img: Path, frame_paths: list[tuple[Path, Path]]):
-	source_face = get_face(cv2.imread(str(source_img)))
-	if not frame_paths:
-		return
-
-	if settings.load_own_model:
-		# needed to run multiple at the same time on the GPU, seems to give better utilization on some
-		swapper = load_face_swapper()
-	else:
-		swapper = get_face_swapper()
-
-	for (src_frame_path, target_frame_path) in frame_paths:
-		if settings.skip_existing and target_frame_path.exists():
-			res = "R"
-		else:
-			src_frame = cv2.imread(str(src_frame_path))
-			res = process_frame(swapper, source_face, src_frame)
-
-		if not isinstance(res, str):
-			is_ok, buffer = cv2.imencode(".png", res)
-			if not is_ok:
-				logger.error("failed encoding image, %r", type(res))
-				settings.progress("P")
-			else:
-				settings.progress(".")
-				write_atomic(buffer, target_frame_path, may_exist = False)
-			del buffer, res
-		else:
-			settings.progress(res)
-			error_handling = settings.error_handling
-			if error_handling is ProcErrorHandling.Ignore:
-				continue
-
-			logger.info("processing error %r for file %s, %s", res, src_frame_path, error_handling.name)
-			if error_handling is ProcErrorHandling.Symlink:
-				ensure(not target_frame_path.exists(), c = target_frame_path)
-				os.symlink(src_frame_path.absolute(), target_frame_path.absolute())
-			else:
-				raise NotImplementedError(error_handling, src_frame_path, target_frame_path)  # TODO
-
-
 def _setup(settings: ProcessSettings, face_img: Path):
 	face = get_face(cv2.imread(str(face_img)))
 
@@ -121,19 +81,51 @@ def _setup(settings: ProcessSettings, face_img: Path):
 	return settings, swapper, face
 
 
-def process_gen(settings: ProcessSettings, face_img: Path, frame_gen):
+def process_gen(settings: ProcessSettings, face_img: Path, frame_gen, process_fn):
 	state = _setup(settings, face_img)
-	for pos, src_frame in enumerate(frame_gen):
-		res = process_gen_frame(*state, src_frame, pos)
+	for pos, src_tup in enumerate(frame_gen):
+		res = process_fn(*state, src_tup, pos)
 		if res is not None:
 			yield res
 
 
-def process_gen_frame(settings, swapper, face, src_frame, pos = None):
+def process_gen_frame_disk(settings, swapper, face, src_tup, pos = None):
+	src_frame_path, target_frame_path = src_tup
+	if settings.skip_existing and target_frame_path.exists():
+		res = "R"
+	else:
+		src_frame = cv2.imread(str(src_frame_path))
+		res = process_frame(swapper, face, src_frame)
+
+	if not isinstance(res, str):
+		is_ok, buffer = cv2.imencode(".png", res)
+		if not is_ok:
+			logger.error("failed encoding image, %r", type(res))
+			settings.progress("P")
+		else:
+			settings.progress(".")
+			write_atomic(buffer, target_frame_path, may_exist = False)
+		del buffer, res
+	else:
+		settings.progress(res)
+		error_handling = settings.error_handling
+		if error_handling is ProcErrorHandling.Ignore:
+			return
+
+		logger.info("processing error %r for file %s, %s", res, src_frame_path, error_handling.name)
+		if error_handling is ProcErrorHandling.Symlink:
+			ensure(not target_frame_path.exists(), c = target_frame_path)
+			os.symlink(src_frame_path.absolute(), target_frame_path.absolute())
+		else:
+			raise NotImplementedError(error_handling, src_frame_path, target_frame_path)  # TODO
+
+
+def process_gen_frame(settings, swapper, face, src_tup, pos = None):
+	src_ctx, src_frame = src_tup
 	res = process_frame(swapper, face, src_frame)
 	if not isinstance(res, str):
 		settings.progress(".")
-		return res
+		return src_ctx, res
 	else:
 		settings.progress(res)
 		error_handling = settings.error_handling
@@ -142,30 +134,9 @@ def process_gen_frame(settings, swapper, face, src_frame, pos = None):
 
 		logger.info("processing error %r for frame #%s, %s", res, pos, error_handling.name)
 		if error_handling is ProcErrorHandling.Copy:
-			return src_frame
+			return src_tup
 		else:
 			raise NotImplementedError(res, error_handling, pos)  # TODO
-
-
-_gen_state = None
-
-
-def _init_gen_state_global(settings: ProcessSettings, source_img: Path):
-	# print("_init_gen_state_global", os.getpid(), os.getppid())
-	global _gen_state
-	ensure(_gen_state is None)
-	_gen_state = _setup(settings, source_img)
-	return _gen_state
-
-
-def process_gen_frame_global(tup, pos = None):
-	global _gen_state
-
-	settings, source_img, src_frame = tup
-	if _gen_state is None:
-		_init_gen_state_global(settings, source_img)
-
-	return process_gen_frame(*_gen_state, src_frame, pos)
 
 
 def process_frame(swapper, source_face, frame):
@@ -183,6 +154,61 @@ def process_frame(swapper, source_face, frame):
 	except Exception as ex:
 		traceback.print_exc()
 		return "E"
+
+
+_gen_state = None
+
+
+def _init_gen_state_global(settings: ProcessSettings, source_img: Path):
+	# print("_init_gen_state_global", os.getpid(), os.getppid())
+	global _gen_state
+	ensure(_gen_state is None)
+	_gen_state = _setup(settings, source_img)
+	return _gen_state
+
+
+def process_gen_frame_global(proc_fn, tup, pos = None):
+	global _gen_state
+
+	settings, source_img, src_frame = tup
+	if _gen_state is None:
+		_init_gen_state_global(settings, source_img)
+
+	return proc_fn(*_gen_state, src_frame, pos)
+
+
+def parallel_process_gen(
+		use_gpu: bool, procs_cpu: int, procs_gpu: int, face_path: Path, frame_gen,
+		process_disk = False,
+):
+	print(f"{procs_cpu=} {procs_gpu=} {use_gpu=}")
+	settings = ProcessSettings(True, False, ProcErrorHandling.Copy, noop)
+	procs = procs_gpu if use_gpu else procs_cpu
+
+	proc_fn = process_gen_frame_disk if process_disk else process_gen_frame
+	if procs > 1:
+		if not use_gpu:
+			import multiprocessing as mp
+		else:
+			import multiprocessing.dummy as mp
+			# Multiple parallel runs on GPU, can do just with threads.
+			# init here since the init later isn't threadsafe and might be done multiple times unnecessarily,
+			# not an issue with actual multiprocess.
+			_init_gen_state_global(settings, face_path)
+
+		pool = mp.Pool(procs)
+
+		def _settings_gen(gen):
+			for i in gen:
+				yield settings, face_path, i
+
+		gen = _settings_gen(frame_gen)
+		fn = functools.partial(process_gen_frame_global, proc_fn)
+		gen = pool.imap(fn, gen)
+	else:
+		gen = process_gen(settings, face_path, frame_gen, proc_fn)
+
+	return gen
 
 
 def process_img(source_img: Path, frame_path: Path, output_file: Path, may_exist: bool = False):

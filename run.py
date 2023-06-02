@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import os
 import shlex
+from typing import Iterable, Any
 
 if not os.environ.get("SKIP_EARLY_TORCH") == "1":
 	import torch  # needs to be imported before onnx for GPU support to work easily apparently
@@ -22,9 +23,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from core.processor import process_video, process_img, get_face, ProcessSettings, ProcErrorHandling, process_gen, _init_gen_state_global, process_gen_frame_global
+from core.processor import process_img, ProcessSettings, parallel_process_gen
 from core.utils import is_img, create_video, add_audio, extract_frames, ensure, Timer, create_video_with_audio, ensure_equal, create_video_from_frame_gen, \
-	tmp_path_move_ctx, noop, str_to_num, get_video_info, VidInfo
+	tmp_path_move_ctx, str_to_num, get_video_info, VidInfo
 import psutil
 
 # DEFAULT_FRAME_SUFFIX_ORG = "_org.png"
@@ -100,25 +101,6 @@ def _frames(frame_paths: list[Path], output_dir: Path, org_suffix: str, swapped_
 	return frames, todo, done
 
 
-def start_processing_cpu(face_img: Path, frame_paths: list[tuple[Path, Path]], settings: ProcessSettings, pool, procnum: int):
-	n = max(len(frame_paths) // procnum, 1)
-	processes = []
-	for i in range(0, len(frame_paths), n):
-		p = pool.apply_async(process_video, args = (settings, face_img, frame_paths[i:i + n]))
-		processes.append(p)
-
-	for p in processes:
-		p.get()
-
-
-def start_processing_gpu_multi(face_img: Path, frame_paths: list[tuple[Path, Path]], settings: ProcessSettings, pool, procnum: int):
-	return start_processing_cpu(face_img, frame_paths, settings, pool, procnum)
-
-
-def start_processing_gpu_single(face_img: Path, frame_paths: list[tuple[Path, Path]], settings: ProcessSettings):
-	process_video(settings, face_img, frame_paths)
-
-
 def status(string):
 	print("Status: " + string)
 
@@ -126,16 +108,21 @@ def status(string):
 _leading_num_reg = re.compile("^(\d+)(?:[^\d]|$)")
 
 
-def get_framepaths(frames_dir: Path, filename_suffix: str, ensure_continuous: bool = True) -> list[Path]:
+def get_framepaths(
+		frames_dir: Path, filename_suffix: str,
+		numbered_only: bool = True, ensure_continuous: bool = True,
+) -> list[Path]:
 	with os.scandir(frames_dir) as it:
 		files = [i for i in it if i.is_file() and i.name.endswith(filename_suffix)]
+
+	if not numbered_only:
+		return [Path(i.path) for i in files]
 
 	with_num = [(int(_leading_num_reg.search(file.name).group(1)), file) for file in files]
 	with_num = sorted(with_num)
 	if ensure_continuous:
 		nums = [i[0] for i in with_num]
 		ensure(nums == sorted(range(1, len(files) + 1)), c = ("expected continuous frames", nums))
-
 	return [Path(i.path) for _, i in with_num]
 
 
@@ -183,38 +170,34 @@ def output_args_replace(format_str: str, face_path: Path, source_path: Path, arg
 def start(args):
 	face_path = Path(args["face"])
 	source_path = Path(args["source_vid"])
-	if not face_path:
-		return print("\n[WARNING] Please select an image containing a face.")
+	image_mode: bool = args["image_mode"]
 
 	if not face_path.is_file():
 		return print("\n[WARNING] face_path not found", face_path)
-
-	if not source_path:
-		return print("\n[WARNING] Please select a video/image to swap face in.")
 
 	if not source_path.exists():
 		return print("\n[WARNING] source_path not found", source_path)
 
 	ensure(not (args["output_vid_formatted"] and args["output_vid"]), c = "got both output_vid_formatted and output_vid")
 	if args["output_vid_formatted"]:
-		args["output_vid"] = _out = output_args_replace(args["output_vid_formatted"], face_path, source_path, args)
+		args["output_vid"] = _out = Path(output_args_replace(args["output_vid_formatted"], face_path, source_path, args))
 		print(f"using formatted output path: {str(_out)!r}")
 
 	source_is_image = source_path.is_file() and is_img(source_path)
 
 	output_path = args["output_vid"]
-	_default_format = args["img_format"] if source_is_image else args["format"]
-	if output_path:
-		output_path = Path(output_path)
-		if output_path.is_dir():
-			output_path = output_path / source_path.with_suffix(f".swapped.{_default_format}").name
-			print(f"output_path is directory, saving to {str(output_path)!r}")
-	else:
-		output_path = source_path.with_suffix(f".swapped.{_default_format}")
-	print(f"saving to {str(output_path)!r}")
+	if not image_mode:
+		_default_format = args["img_format"] if source_is_image else args["format"]
+		if output_path:
+			if output_path.is_dir():
+				output_path = output_path / source_path.with_suffix(f".swapped.{_default_format}").name
+				print(f"output_path is directory, saving to {str(output_path)!r}")
+		else:
+			output_path = source_path.with_suffix(f".swapped.{_default_format}")
+		if not args["overwrite"]:
+			ensure(not output_path.exists(), c = ("output_path exists", output_path))
 
-	if not args["overwrite"]:
-		ensure(not output_path.exists(), c = ("output_path exists", output_path))
+	print(f"saving to {str(output_path)!r}")
 
 	if source_path.is_file():
 		if is_img(source_path):
@@ -224,7 +207,8 @@ def start(args):
 		vid_info = get_video_info(source_path, ffprobe = args["ffprobe"])
 	else:
 		vid_info = VidInfo(0, 0, args["fps_source"], False)
-		ensure(vid_info.fps, c = ("source_path is png sequence, manually passing --fps_source framerate argument required"))
+		if not (image_mode and not output_path):
+			ensure(vid_info.fps, c = ("source_path is png sequence, manually passing --fps_source framerate argument required"))
 
 	with Timer("setgrad took {:.2f} secs"):
 		import torch
@@ -239,21 +223,12 @@ def start(args):
 		fps_use = None
 		fps_swapped = vid_info.fps
 
-	if args["work_dir"]:
-		workdir = Path(args["work_dir"])
-	elif args["work_dir_root"]:
-		workdir = Path(args["work_dir_root"])
-		workdir = workdir / f"{output_path.name}.tmp"
-	else:
-		workdir = output_path.with_name(output_path.name + ".tmp")
-
-	stream = args["stream"]
 	with Timer("full processing took {:.4f} secs"):
-		if stream:
-			ensure(not source_path.is_dir(), c = "directory sources not implemented for stream")
-			process_streamed(args, source_path, face_path, workdir, output_path, vid_info, fps_use, fps_swapped)
+		if image_mode:
+			process_image_mode(args, face_path, source_path, output_path, fps_use, fps_swapped)
 		else:
-			process_using_frames(args, source_path, face_path, workdir, output_path, fps_use, fps_swapped)
+			ensure(not source_path.is_dir(), c = "directory sources not implemented for stream")
+			process_streamed(args, face_path, source_path, output_path, vid_info, fps_use, fps_swapped)
 
 
 def _split_shell_args(args):
@@ -265,15 +240,17 @@ def _split_shell_args(args):
 	return res
 
 
+def _rem_ctx(gen):
+	for ctx, i in gen:
+		yield i
+
+
 def process_streamed(
-		args: dict, source_path: Path, face_path: Path, workdir: Path,
+		args: dict, face_path: Path, source_path: Path,
 		output_path: Path, vid_info: VidInfo,
 		src_fps_output_max: int | float | None,  # fps to read from source, so drop frames if src fps is higher, None = use all frames.
-		fps_swapped: int | float,  # fps that will be output, always same as fps_use if that isn't None
+		fps_output: int | float,  # fps that will be output, always same as fps_use if that isn't None
 ):
-	vid_output_audio: bool = args["vid_output_audio"]
-	overwrite = args["overwrite"]
-
 	# Note: cv2 VideoCapture is much faster (almost 2x) but has no way to easily skip frames,
 	# would have to get frame timestamps and implement skipping by hand when using fps_use to always use, or assume constant fps.
 
@@ -282,36 +259,17 @@ def process_streamed(
 	else:
 		gen = _frame_gen_ffmpeg(args, source_path, vid_info.width, vid_info.height, src_fps_output_max)
 
-	settings = ProcessSettings(True, False, ProcErrorHandling.Copy, noop)
+	# _swap_gen wants each frame to be (some_identifier_or_ctx, frame) so use enumerate to just get pos
+	# and then remove again afterwards for vid_save_gen that just wants frames
+	gen = enumerate(gen)
+	gen = parallel_process_gen(args["gpu"], args["parallel_cpu"], args["parallel_gpu"], face_path, gen)
+	gen = _rem_ctx(gen)
+	vid_save_gen(args, source_path, output_path, vid_info, fps_output, gen)
 
-	procs_cpu = args["parallel_cpu"]
-	procs_gpu = args["parallel_gpu"]
-	use_gpu = args["gpu"]
-	procs = procs_gpu if use_gpu else procs_cpu
-	print(f"{procs_cpu=} {procs_gpu=} {use_gpu=}")
-	if procs > 1:
-		if not use_gpu:
-			import multiprocessing as mp
-		else:
-			import multiprocessing.dummy as mp
-			# Multiple parallel runs on GPU, can do just with threads.
-			# init here since the init later isn't threadsafe and might be done multiple times unnecessarily,
-			# not an issue with actual multiprocess.
-			_init_gen_state_global(settings, face_path)
 
-		pool = mp.Pool(procs)
-
-		def _settings_gen(gen):
-			for i in gen:
-				yield settings, face_path, i
-
-		gen = _settings_gen(gen)
-		gen = pool.imap(process_gen_frame_global, gen)
-	else:
-		gen = process_gen(settings, face_path, gen)
-
-	_tmp_file_ctx = functools.partial(tmp_path_move_ctx, trail_org_ext = True, overwrite = overwrite, overwrite_delete = overwrite)
-
+def vid_save_gen(args, source_path: Path, output_path: Path, vid_info: VidInfo, fps_output: int | float, frame_gen):
+	vid_output_audio: bool = args["vid_output_audio"]
+	overwrite = args["overwrite"]
 	audio_source_path = None
 	if args["direct_audio"] and vid_info.has_audio:
 		output_path_gen = output_path
@@ -328,10 +286,11 @@ def process_streamed(
 			# no audio, can write to final filepath right away
 			output_path_gen = output_path
 
+	_tmp_file_ctx = functools.partial(tmp_path_move_ctx, trail_org_ext = True, overwrite = overwrite, overwrite_delete_tmp = overwrite)
 	with _tmp_file_ctx(output_path_gen) as tmp_path:
 		ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info", *_split_shell_args(args["out_ff_args"])])
 		create_video_from_frame_gen(
-			gen, vid_info.width, vid_info.height, fps_swapped, tmp_path,
+			frame_gen, vid_info.width, vid_info.height, fps_output, tmp_path,
 			preset = args["preset"], crf = args["crf"], audio_source_path = audio_source_path, audio_shortest = args["audio_shortest"],
 			**ffmpeg,
 		)
@@ -381,28 +340,45 @@ def _frame_gen_cv2(source_path: Path):
 		yield frame
 
 
-def process_using_frames(
-		args: dict, source_path: Path, face_path: Path, workdir: Path,
-		output_path: Path,
+def error_exit(message: str):
+	print("ERROR:", message)
+	exit(1)
+
+
+def process_image_mode(
+		args: dict, face_path: Path, source_path: Path,
+		output_path: Path | None,
 		# fps for frames to take from source, None if using all,
 		fps_use: int | float | None,
 		fps_swapped: int | float,  # fps that will be output, always same as fps_use if that is given
 ):
-	vid_output_audio: bool = args["vid_output_audio"]
+	if args["work_dir"]:
+		workdir = Path(args["work_dir"])
+	else:
+		if output_path:
+			_workdir_name = f"{output_path.name}.tmp"
+			if args["work_dir_root"]:
+				workdir = Path(args["work_dir_root"])
+				workdir = workdir / _workdir_name
+			else:
+				workdir = output_path.with_name(_workdir_name)
+		else:
+			workdir = None
+
 	name_suffix_org = args["name_suffix_org"]
 	name_suffix_swapped = args["name_suffix_swapped"]
 	ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info"])
-
-	output_path_plain = None
-	if args["vid_output_plain"]:
-		output_path_plain = output_path.with_suffix(".plain." + (args["plain_format"] or args["format"]))
-		ensure(not output_path_plain.exists(), c = ("output_path_plain exists", output_path_plain))
 
 	if source_path.is_file():
 		if args["frames_dir"]:
 			in_frames_dir = Path(args["frames_dir"])
 		else:
 			_root = args["frames_dir_root"] or workdir
+			if not _root:
+				exit(error_exit(
+					"in image-mode without output_path, with video source_path given, "
+					"one of work_dir or frames_dir or frames_dir_root required to extract source_video frames to"
+				))
 			in_frames_dir = _root / f"f_in__{source_path.name}__F{fps_use or 'srcfps'}"
 			if in_frames_dir.exists():
 				status(f"frames dir exists, not extracting again, assuming okay: {str(in_frames_dir)!r}")
@@ -415,14 +391,19 @@ def process_using_frames(
 		ensure(source_path.is_dir())
 		in_frames_dir = source_path
 
-	in_frame_paths = get_framepaths(in_frames_dir, name_suffix_org)
-	status(f"got {len(in_frame_paths)} frames total.")
+	in_frame_paths = get_framepaths(in_frames_dir, name_suffix_org, numbered_only = bool(output_path), ensure_continuous = bool(output_path))
+	status(f"got {len(in_frame_paths)} input frames/images total.")
 
 	with Timer("swap took {:.2f} secs"):
 		if args["swapped_dir"]:
 			swapped_frames_dir = Path(args["swapped_dir"])
 		else:
 			_root = args["swapped_dir_root"] or workdir
+			if not _root:
+				exit(error_exit(
+					"in image-mode without output_path, "
+					"one of work_dir or swapped_dir or swapped_dir_root required to write swapped frames to"
+				))
 			swapped_frames_dir = _root / f"f_swapped__{source_path.name}__F{fps_use or 'srcfps'}"
 			makedir(swapped_frames_dir, exist_ok = True, parents = 2)
 
@@ -447,68 +428,64 @@ def process_using_frames(
 
 		if fp_todo:
 			status(f"swapping {len(fp_todo)} frames of {len(fp_all)} total, {len(fp_done)} finished.")
-			procs_cpu = args["parallel_cpu"]
-			procs_gpu = args["parallel_gpu"]
-			use_gpu = args["gpu"]
-			print(f"{procs_cpu=} {procs_gpu=} {use_gpu=}")
+			try:
+				import tqdm
+				fp_todo_use = tqdm.tqdm(fp_todo)
+			except ImportError:
+				fp_todo_use = fp_todo
 
-			settings = ProcessSettings(False, False, ProcErrorHandling.Log)
-
-			pool = None
-			if use_gpu:
-				print("running on GPU")
-				if procs_gpu > 1:
-					import multiprocessing.dummy as mp
-					pool = mp.Pool(procs_gpu)
-					settings.load_own_model = True
-					start_processing_gpu_multi(face_path, fp_todo, settings, pool, procs_gpu)
-				else:
-					try:
-						import tqdm
-						fp_todo_use = tqdm.tqdm(fp_todo)
-					except ImportError:
-						fp_todo_use = fp_todo
-					start_processing_gpu_single(face_path, fp_todo_use, settings)
-			else:
-				import multiprocessing as mp
-				pool = mp.Pool(procs_cpu)
-				start_processing_cpu(face_path, fp_todo, settings, pool, procs_cpu)
-
-			if pool is not None:
-				pool.close()
-				pool.join()
+			gen = parallel_process_gen(args["gpu"], args["parallel_cpu"], args["parallel_gpu"], face_path, fp_todo_use, True)
+			for i in gen:
+				pass
 		else:
 			status("skipping swapping, all finished already")
 
+	if not output_path:
+		status("swap successful!")
+		return
+
+	status("swap successful!, creating output video")
+	output_path_plain = None
+	if args["vid_output_plain"]:
+		output_path_plain = output_path.with_suffix(".plain." + (args["plain_format"] or args["format"]))
+		ensure(not output_path_plain.exists(), c = ("output_path_plain exists", output_path_plain))
+
 	swapped_pat = name_pattern(name_suffix_swapped)
 	ffargs = dict(filename_pattern = swapped_pat, **ffmpeg)
+
+	overwrite: bool = args["overwrite"]
+	_tmp_file_ctx = functools.partial(tmp_path_move_ctx, trail_org_ext = True, overwrite = overwrite, overwrite_delete_tmp = overwrite)
+
+	vid_output_audio: bool = args["vid_output_audio"]
 	if vid_output_audio:
 		if output_path_plain is not None:
-			status(f"creating plain video with fps {fps_swapped} from {len(fp_all)} frames at {str(output_path_plain)!r} without any audio.")
-			create_video(swapped_frames_dir, fps_swapped, output_path_plain, **ffargs)
+			with _tmp_file_ctx(output_path_plain) as tmp_path:
+				status(f"creating plain video with fps {fps_swapped} from {len(fp_all)} frames at {str(output_path_plain)!r} without any audio.")
+				create_video(swapped_frames_dir, fps_swapped, tmp_path, **ffargs)
 
-		status(f"creating video with fps {fps_swapped} from {len(fp_all)} frames at {str(output_path)!r} with audio from {str(source_path)!r}")
-		create_video_with_audio(swapped_frames_dir, fps_swapped, source_path, output_path, **ffargs)
+		with _tmp_file_ctx(output_path) as tmp_path:
+			status(f"creating video with fps {fps_swapped} from {len(fp_all)} frames at {str(output_path)!r} with audio from {str(source_path)!r}")
+			create_video_with_audio(swapped_frames_dir, fps_swapped, tmp_path, source_path, **ffargs)
 	else:
-		status(f"creating video with fps {fps_swapped} from {len(fp_all)} frames at {str(output_path)!r} without any audio.")
-		create_video(swapped_frames_dir, fps_swapped, output_path, **ffargs)
-
-	status("swap successful!")
-	return
+		with _tmp_file_ctx(output_path) as tmp_path:
+			status(f"creating video with fps {fps_swapped} from {len(fp_all)} frames at {str(output_path)!r} without any audio.")
+			create_video(swapped_frames_dir, fps_swapped, tmp_path, **ffargs)
 
 
 def make_parser():
+	# TODO: support both - and _ in -- args
 	parser = argparse.ArgumentParser()
-	parser.add_argument("-f", "--face", help = "use this face")
-	parser.add_argument("-s", "--source_vid", help = "replace this face")
-	parser.add_argument("-o", "--output_vid", help = "save output to this file")
+	parser.add_argument("-f", "--face", type = Path, required = True, help = "use this face")
+	parser.add_argument("-s", "--source_vid", type = Path, required = True, help = "replace this face")
+	parser.add_argument("-o", "--output_vid", type = Path, help = "save output to this file")
 	parser.add_argument("-O", "--output_vid_formatted", help = "save output to this file with {} formatting")
+
+	parser.add_argument("--image_mode", action = "store_true",
+						help = "work with directories of images")
 
 	parser.add_argument("-y", "--overwrite", action = "store_true", help = "save output to this file with {} formatting")
 	parser.add_argument("--gpu", action = "store_true",
 						help = "use gpu")
-	parser.add_argument("--stream", action = "store_true",
-						help = "no frame files just do everything in mem and write directly to plain output file")
 	parser.add_argument("--keep_frames", action = "store_true",
 						help = "keep frames directory")
 	parser.add_argument("-r", "--fps_target", type = str_to_num,
@@ -590,11 +567,15 @@ def make_parser():
 
 
 if __name__ == "__main__":
-	parser = make_parser()
-	args = { }
-	for name, value in vars(parser.parse_args()).items():
-		args[name] = value
+	def setup():
+		parser = make_parser()
+		args = { }
+		for name, value in vars(parser.parse_args()).items():
+			args[name] = value
 
-	pre_check()
-	limit_resources(args)
-	start(args)
+		pre_check()
+		limit_resources(args)
+		start(args)
+
+
+	setup()
