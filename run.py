@@ -513,7 +513,7 @@ def make_parser():
 	parser.add_argument("--fps_source", type = str_to_num,
 						help = "source video fps, only needed for png sequence folder sources or maybe weird file formats")
 
-	parser.add_argument("--crf", type = int, default = 14,
+	parser.add_argument("--crf", type = int, default = 15,
 						help = "output crf")
 	parser.add_argument("--preset", default = "superfast",
 						help = "output preset")
@@ -560,9 +560,6 @@ def make_parser():
 
 	parser.add_argument("--work_dir", type = existing_path, help = "work tmp dir")
 	parser.add_argument("--work_dir_root", type = existing_path, help = "work tmp root dir")
-
-	parser.add_argument("--no_face_check", action = "store_false", dest = "face_check",
-						help = "skip checking for face in first image")
 
 	parser.add_argument("-A", "--no_audio", dest = "vid_output_audio", action = "store_false",
 						help = "dont try to copy audio from source")
