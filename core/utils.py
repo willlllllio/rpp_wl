@@ -20,6 +20,18 @@ def str_to_num(num: str) -> int | float:
 	return int(num)
 
 
+def to_num(num: str | int | float) -> int | float:
+	if isinstance(num, str):
+		if "." in num or "e" in num:
+			return float(num)
+		return int(num)
+
+	if isinstance(num, int) or isinstance(num, float):
+		return num
+
+	raise ValueError("not a num", num)
+
+
 def run_command(command, mode = "silent"):
 	if mode == "debug":
 		return os.system(command)
@@ -54,7 +66,7 @@ def get_video_info(vid_path: str | Path, ffprobe = "ffprobe"):
 	ensure(height and isinstance(height, int), c = repr(height))
 
 	a, b = map(str_to_num, vid["r_frame_rate"].split("/"))
-	fps = str_to_num(a) / str_to_num(b) if b != 1 else a
+	fps = a / b if b != 1 else a
 
 	audio = by_type.get("audio")
 	return VidInfo(width, height, fps, bool(audio))
@@ -165,7 +177,7 @@ def create_video(
 	subprocess.check_output([
 		ffmpeg, "-n", *(extra_args or []),
 		"-framerate", str(fps),
-		"-i", frames_dir / filename_pattern,
+		"-i", str(frames_dir / filename_pattern),
 		*audio,
 		"-c:v", "libx264", *preset, *crf, "-pix_fmt", "yuv420p",
 		str(target)
@@ -181,13 +193,20 @@ def create_video_with_audio(
 ):
 	preset = ["-preset", preset] if preset else []
 	crf = ["-crf", str(crf)] if crf else []
+
+	audio = []
+	if audio_source_path is not None:
+		audio = [
+			"-i", str(audio_source_path),
+			*(["-shortest"] if audio_shortest else []),
+			"-map", "0:v:0", "-map", "1:a:0",
+		]
+
 	subprocess.check_output([
 		ffmpeg, "-n", *(extra_args or []),
 		"-framerate", str(fps),
-		"-i", frames_dir / filename_pattern,
-		"-i", str(audio_source_path),
-		*(["-shortest"] if audio_shortest else []),
-		"-map", "0:v:0", "-map", "1:a:0",
+		"-i", str(frames_dir / filename_pattern),
+		*audio,
 		"-c:v", "libx264", *preset, *crf, "-pix_fmt", "yuv420p",
 		str(target)
 	])

@@ -108,15 +108,9 @@ def status(string):
 _leading_num_reg = re.compile("^(\d+)(?:[^\d]|$)")
 
 
-def get_framepaths(
-		frames_dir: Path, filename_suffix: str,
-		numbered_only: bool = True, ensure_continuous: bool = True,
-) -> list[Path]:
+def get_framepaths(frames_dir: Path, filename_suffix: str, ensure_continuous: bool = True) -> list[Path]:
 	with os.scandir(frames_dir) as it:
 		files = [i for i in it if i.is_file() and i.name.endswith(filename_suffix)]
-
-	if not numbered_only:
-		return [Path(i.path) for i in files]
 
 	with_num = [(int(_leading_num_reg.search(file.name).group(1)), file) for file in files]
 	with_num = sorted(with_num)
@@ -124,6 +118,13 @@ def get_framepaths(
 		nums = [i[0] for i in with_num]
 		ensure(nums == sorted(range(1, len(files) + 1)), c = ("expected continuous frames", nums))
 	return [Path(i.path) for _, i in with_num]
+
+
+def get_imagepaths(frames_dir: Path, filename_suffix: str) -> list[Path]:
+	with os.scandir(frames_dir) as it:
+		files = [i for i in it if i.is_file() and i.name.endswith(filename_suffix)]
+
+	return [Path(i.path) for i in files if is_img(i.path)]
 
 
 def makedir(path: str | Path, exist_ok = False, parents: bool | int = False):
@@ -225,7 +226,7 @@ def start(args):
 
 	with Timer("full processing took {:.4f} secs"):
 		if image_mode:
-			process_image_mode(args, face_path, source_path, output_path, fps_use, fps_swapped)
+			process_image_mode(args, face_path, source_path, output_path, vid_info, fps_use, fps_swapped)
 		else:
 			ensure(not source_path.is_dir(), c = "directory sources not implemented for stream")
 			process_streamed(args, face_path, source_path, output_path, vid_info, fps_use, fps_swapped)
@@ -268,6 +269,25 @@ def process_streamed(
 
 
 def vid_save_gen(args, source_path: Path, output_path: Path, vid_info: VidInfo, fps_output: int | float, frame_gen):
+	output_path_write, audio_source_path, audio_2stage, overwrite = _video_save(args, source_path, output_path, vid_info)
+
+	_tmp_file_ctx = functools.partial(tmp_path_move_ctx, trail_org_ext = True, overwrite = overwrite, overwrite_delete_tmp = overwrite)
+	with _tmp_file_ctx(output_path_write) as tmp_path:
+		ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info", *_split_shell_args(args["out_ff_args"])])
+		create_video_from_frame_gen(
+			frame_gen, vid_info.width, vid_info.height, fps_output, tmp_path,
+			preset = args["preset"], crf = args["crf"], audio_source_path = audio_source_path, audio_shortest = args["audio_shortest"],
+			**ffmpeg,
+		)
+
+	if audio_2stage:
+		ensure(output_path != output_path_write)
+		with _tmp_file_ctx(output_path) as tmp_path:
+			ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info", *_split_shell_args(args["audio_ff_args"])])
+			add_audio(output_path_write, source_path, tmp_path, shortest = args["audio_shortest"], **ffmpeg)
+
+
+def _video_save(args, source_path: Path, output_path: Path, vid_info: VidInfo):
 	vid_output_audio: bool = args["vid_output_audio"]
 	overwrite = args["overwrite"]
 	audio_source_path = None
@@ -286,20 +306,7 @@ def vid_save_gen(args, source_path: Path, output_path: Path, vid_info: VidInfo, 
 			# no audio, can write to final filepath right away
 			output_path_gen = output_path
 
-	_tmp_file_ctx = functools.partial(tmp_path_move_ctx, trail_org_ext = True, overwrite = overwrite, overwrite_delete_tmp = overwrite)
-	with _tmp_file_ctx(output_path_gen) as tmp_path:
-		ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info", *_split_shell_args(args["out_ff_args"])])
-		create_video_from_frame_gen(
-			frame_gen, vid_info.width, vid_info.height, fps_output, tmp_path,
-			preset = args["preset"], crf = args["crf"], audio_source_path = audio_source_path, audio_shortest = args["audio_shortest"],
-			**ffmpeg,
-		)
-
-	if audio_2stage:
-		ensure(output_path != output_path_gen)
-		with _tmp_file_ctx(output_path) as tmp_path:
-			ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info", *_split_shell_args(args["audio_ff_args"])])
-			add_audio(output_path_gen, source_path, tmp_path, shortest = args["audio_shortest"], **ffmpeg)
+	return output_path_gen, audio_source_path, audio_2stage, overwrite
 
 
 def _frame_gen_ffmpeg(args, source_path: Path, width, height, fps_to_output: int | float | None, ):
@@ -347,7 +354,7 @@ def error_exit(message: str):
 
 def process_image_mode(
 		args: dict, face_path: Path, source_path: Path,
-		output_path: Path | None,
+		output_path: Path | None, vid_info: VidInfo,
 		# fps for frames to take from source, None if using all,
 		fps_use: int | float | None,
 		fps_swapped: int | float,  # fps that will be output, always same as fps_use if that is given
@@ -391,12 +398,17 @@ def process_image_mode(
 		ensure(source_path.is_dir())
 		in_frames_dir = source_path
 
-	in_frame_paths = get_framepaths(in_frames_dir, name_suffix_org, numbered_only = bool(output_path), ensure_continuous = bool(output_path))
+	if output_path:
+		in_frame_paths = get_framepaths(in_frames_dir, name_suffix_org, ensure_continuous = True)
+	else:
+		in_frame_paths = get_imagepaths(in_frames_dir, name_suffix_org)
+
 	status(f"got {len(in_frame_paths)} input frames/images total.")
 
 	with Timer("swap took {:.2f} secs"):
 		if args["swapped_dir"]:
 			swapped_frames_dir = Path(args["swapped_dir"])
+			makedir(swapped_frames_dir, exist_ok = True, parents = False)
 		else:
 			_root = args["swapped_dir_root"] or workdir
 			if not _root:
@@ -444,32 +456,29 @@ def process_image_mode(
 		status("swap successful!")
 		return
 
-	status("swap successful!, creating output video")
-	output_path_plain = None
-	if args["vid_output_plain"]:
-		output_path_plain = output_path.with_suffix(".plain." + (args["plain_format"] or args["format"]))
-		ensure(not output_path_plain.exists(), c = ("output_path_plain exists", output_path_plain))
+	vid_save_frames(args, swapped_frames_dir, source_path, output_path, vid_info, fps_swapped)
 
-	swapped_pat = name_pattern(name_suffix_swapped)
-	ffargs = dict(filename_pattern = swapped_pat, **ffmpeg)
 
-	overwrite: bool = args["overwrite"]
+def vid_save_frames(args, swapped_frames_dir: Path, source_path: Path, output_path: Path, vid_info: VidInfo, fps_output: int | float):
+	output_path_write, audio_source_path, audio_2stage, overwrite = _video_save(args, source_path, output_path, vid_info)
+
+	swapped_pat = name_pattern(args["name_suffix_swapped"])
 	_tmp_file_ctx = functools.partial(tmp_path_move_ctx, trail_org_ext = True, overwrite = overwrite, overwrite_delete_tmp = overwrite)
+	with _tmp_file_ctx(output_path_write) as tmp_path:
+		ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info", *_split_shell_args(args["out_ff_args"])])
+		create_video_with_audio(
+			swapped_frames_dir, fps_output, tmp_path,
+			audio_source_path = audio_source_path, audio_shortest = args["audio_shortest"],
+			filename_pattern = swapped_pat,
+			preset = args["preset"], crf = args["crf"],
+			**ffmpeg,
+		)
 
-	vid_output_audio: bool = args["vid_output_audio"]
-	if vid_output_audio:
-		if output_path_plain is not None:
-			with _tmp_file_ctx(output_path_plain) as tmp_path:
-				status(f"creating plain video with fps {fps_swapped} from {len(fp_all)} frames at {str(output_path_plain)!r} without any audio.")
-				create_video(swapped_frames_dir, fps_swapped, tmp_path, **ffargs)
-
+	if audio_2stage:
+		ensure(output_path != output_path_write)
 		with _tmp_file_ctx(output_path) as tmp_path:
-			status(f"creating video with fps {fps_swapped} from {len(fp_all)} frames at {str(output_path)!r} with audio from {str(source_path)!r}")
-			create_video_with_audio(swapped_frames_dir, fps_swapped, tmp_path, source_path, **ffargs)
-	else:
-		with _tmp_file_ctx(output_path) as tmp_path:
-			status(f"creating video with fps {fps_swapped} from {len(fp_all)} frames at {str(output_path)!r} without any audio.")
-			create_video(swapped_frames_dir, fps_swapped, tmp_path, **ffargs)
+			ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info", *_split_shell_args(args["audio_ff_args"])])
+			add_audio(output_path_write, source_path, tmp_path, shortest = args["audio_shortest"], **ffmpeg)
 
 
 def make_parser():
@@ -536,10 +545,10 @@ def make_parser():
 	parser.add_argument("--frames_dir", type = existing_path, help = "source frames tmp dir")
 	parser.add_argument("--frames_dir_root", type = existing_path, help = "source frames tmp root dir")
 
-	parser.add_argument("--swapped_dir", type = existing_path, help = "swapped tmp dir")
+	parser.add_argument("--swapped_dir", type = Path, help = "swapped tmp dir")
 	parser.add_argument("--swapped_dir_root", type = existing_path, help = "swapped tmp root dir")
 
-	parser.add_argument("--work_dir", type = existing_path, help = "work tmp dir")
+	parser.add_argument("--work_dir", type = Path, help = "work tmp dir")
 	parser.add_argument("--work_dir_root", type = existing_path, help = "work tmp root dir")
 
 	parser.add_argument("-A", "--no_audio", dest = "vid_output_audio", action = "store_false",
