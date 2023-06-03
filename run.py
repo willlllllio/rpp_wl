@@ -490,28 +490,38 @@ def vid_save_frames(args, swapped_frames_dir: Path, source_path: Path, output_pa
 
 
 def make_parser():
-	def add_argument_dash_underline(org_fn, *args, **kwargs):
-		# Make arguments work both with --what-ever and --what_ever.
-		# For every "--what-ever_thing_name" argument name add the original version
-		# and one with "-" replaced with "_", and one with "_" -> "-"
-		# ,if the original wasn't the same already.
+	def make_add_argument(
+			add_dash_to_underscore: bool,  # --what-ever -> --what_ever
+			add_underscore_to_dash: bool,  # --what_ever -> --what-ever
+			add_no_underscore: bool,  # --what_ever -> --whatever
+			add_no_dash: bool,  # --what-ever -> --whatever
+			keep_original: bool = True,
+	):
+		def _custom_add_argument(org_fn, *args, **kwargs):
+			new = []
+			for i in args:
+				if isinstance(i, str) and i.startswith("--"):
+					add = (
+						i if keep_original else None,
+						"--" + i[2:].replace("_", "-") if add_underscore_to_dash else None,
+						"--" + i[2:].replace("-", "_") if add_dash_to_underscore else None,
+						"--" + i[2:].replace("_", "") if add_no_underscore else None,
+						"--" + i[2:].replace("-", "") if add_no_dash else None,
+					)
+					new.extend(i for i in add if i is not None)
+				else:
+					new.append(i)
 
-		new = []
-		for i in args:
-			if isinstance(i, str) and i.startswith("--"):
-				for a in (
-						i,
-						"--" + i[2:].replace("_", "-"),
-						"--" + i[2:].replace("-", "_"),
-				):
-					if a not in new:
-						new.append(a)
-			else:
-				new.append(i)
-		return org_fn(*new, **kwargs)
+			return org_fn(*new, **kwargs)
+
+		return _custom_add_argument
+
+	add_arg = make_add_argument(
+		True, True, True, True, True
+	)
 
 	def patch_parser(parser):
-		parser.add_argument = functools.partial(add_argument_dash_underline, parser.add_argument)
+		parser.add_argument = functools.partial(add_arg, parser.add_argument)
 
 	parser = argparse.ArgumentParser()
 	patch_parser(parser)
