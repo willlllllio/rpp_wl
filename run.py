@@ -582,8 +582,8 @@ if __name__ == "__main__":
 		for name, value in vars(parser.parse_args()).items():
 			args[name] = value
 
-		pre_check()
-		limit_resources(args)
+		# pre_check()
+		# limit_resources(args)
 		start(args)
 
 
