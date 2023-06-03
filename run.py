@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import os
+
 import shlex
 from typing import Iterable, Any
 
@@ -23,7 +24,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from core.processor import process_img, ProcessSettings, parallel_process_gen
+from core.processor import process_img, ProcessSettings, parallel_process_gen, SwapSettings
 from core.utils import is_img, create_video, add_audio, extract_frames, ensure, Timer, create_video_with_audio, ensure_equal, create_video_from_frame_gen, \
 	tmp_path_move_ctx, str_to_num, get_video_info, VidInfo
 import psutil
@@ -263,7 +264,8 @@ def process_streamed(
 	# _swap_gen wants each frame to be (some_identifier_or_ctx, frame) so use enumerate to just get pos
 	# and then remove again afterwards for vid_save_gen that just wants frames
 	gen = enumerate(gen)
-	gen = parallel_process_gen(args["gpu"], args["parallel_cpu"], args["parallel_gpu"], face_path, gen)
+	settings = SwapSettings(face_path, False)
+	gen = parallel_process_gen(args["gpu"], args["parallel_cpu"], args["parallel_gpu"], settings, gen)
 	gen = _rem_ctx(gen)
 	vid_save_gen(args, source_path, output_path, vid_info, fps_output, gen)
 
@@ -446,7 +448,8 @@ def process_image_mode(
 			except ImportError:
 				fp_todo_use = fp_todo
 
-			gen = parallel_process_gen(args["gpu"], args["parallel_cpu"], args["parallel_gpu"], face_path, fp_todo_use, True)
+			settings = SwapSettings(face_path, False)
+			gen = parallel_process_gen(args["gpu"], args["parallel_cpu"], args["parallel_gpu"], settings, fp_todo_use, True)
 			for i in gen:
 				pass
 		else:
