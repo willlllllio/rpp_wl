@@ -158,7 +158,7 @@ def output_args_replace(format_str: str, face_path: Path, source_path: Path, arg
 			return source_path.with_suffix("").name
 		if name == "face_bnc":
 			return face_path.with_suffix("").name
-		if name == "format":
+		if name in ("format", "F", "ext"):
 			return args["format"]
 		if name == "plain_format":
 			return args["plain_format"] or args["format"]
@@ -482,58 +482,83 @@ def vid_save_frames(args, swapped_frames_dir: Path, source_path: Path, output_pa
 
 
 def make_parser():
-	# TODO: support both - and _ in -- args
-	parser = argparse.ArgumentParser()
-	parser.add_argument("-f", "--face", type = Path, required = True, help = "use this face")
-	parser.add_argument("-s", "--source_vid", type = Path, required = True, help = "replace this face")
-	parser.add_argument("-o", "--output_vid", type = Path, help = "save output to this file")
-	parser.add_argument("-O", "--output_vid_formatted", help = "save output to this file with {} formatting")
+	def add_argument_dash_underline(org_fn, *args, **kwargs):
+		# Make arguments work both with --what-ever and --what_ever.
+		# For every "--what-ever_thing_name" argument name add the original version
+		# and one with "-" replaced with "_", and one with "_" -> "-"
+		# ,if the original wasn't the same already.
 
-	parser.add_argument("--image_mode", action = "store_true",
+		new = []
+		for i in args:
+			if isinstance(i, str) and i.startswith("--"):
+				for a in (
+						i,
+						"--" + i[2:].replace("_", "-"),
+						"--" + i[2:].replace("-", "_"),
+				):
+					if a not in new:
+						new.append(a)
+			else:
+				new.append(i)
+		return org_fn(*new, **kwargs)
+
+	def patch_parser(parser):
+		parser.add_argument = functools.partial(add_argument_dash_underline, parser.add_argument)
+
+	parser = argparse.ArgumentParser()
+	patch_parser(parser)
+	parser.add_argument("-f", "--face", type = Path, required = True, help = "use this face")
+	parser.add_argument("-s", "--source-vid", type = Path, required = True, help = "replace this face")
+	parser.add_argument("-o", "--output-vid", type = Path, help = "save output to this file")
+	parser.add_argument("-O", "--output-vid-formatted", help = "save output to this file with {} formatting")
+
+	parser.add_argument("-v", "--verbose", action = "store_true")
+
+	parser.add_argument("--image-mode", action = "store_true",
 						help = "work with directories of images")
 
 	parser.add_argument("-y", "--overwrite", action = "store_true", help = "save output to this file with {} formatting")
 	parser.add_argument("--gpu", action = "store_true",
 						help = "use gpu")
-	parser.add_argument("--keep_frames", action = "store_true",
+	parser.add_argument("--keep-frames", action = "store_true",
 						help = "keep frames directory")
-	parser.add_argument("-r", "--fps_target", type = str_to_num,
+	parser.add_argument("-r", "--fps-target", type = str_to_num,
 						help = "maximum source fps wanted, will drop frames if source is higher fps, does nothing if source fps is lower")
-	parser.add_argument("--fps_source", type = str_to_num,
+	parser.add_argument("--fps-source", type = str_to_num,
 						help = "source video fps, only needed for png sequence folder sources or maybe weird file formats")
 
 	parser.add_argument("--crf", type = int, default = 15,
 						help = "output crf")
 	parser.add_argument("--preset", default = "superfast",
 						help = "output preset")
-	parser.add_argument("--out_ff_args", action = "append",
+	parser.add_argument("--out-ff-args", action = "append",
 						help = "extra output ffmpeg args")
-	parser.add_argument("--audio_ff_args", action = "append",
+	parser.add_argument("--audio-ff-args", action = "append",
 						help = "extra audio merging ffmpeg args")
 
-	parser.add_argument("--audio_shortest", action = "store_true",
+	parser.add_argument("--audio-shortest", action = "store_true",
 						help = "shorten audio file to vid length, should only be needed if seeking with -XYZ")
 
-	parser.add_argument("-R", "--ffmpeg_reader", action = "store_true",
+	parser.add_argument("-R", "--ffmpeg-reader", action = "store_true",
 						help = "always use ffmpeg source reader")
-	parser.add_argument("--cv2_reader", action = "store_true",
+	parser.add_argument("--cv2-reader", action = "store_true",
 						help = "always use opencv source reader")
 
-	parser.add_argument("-X", "--ffmpeg_reader_args_0", action = "append",
+	parser.add_argument("-X", "--ffmpeg-reader-args-0", action = "append",
 						help = "arguments passed to ffmpeg reader in front of args. Note: add space in front if it starts with -")
-	parser.add_argument("-Y", "--ffmpeg_reader_args_1", action = "append",
+	parser.add_argument("-Y", "--ffmpeg-reader-args-1", action = "append",
 						help = "arguments passed to ffmpeg reader after input. Note: add space in front if it starts with -")
-	parser.add_argument("-Z", "--ffmpeg_reader_args_2", action = "append",
+	parser.add_argument("-Z", "--ffmpeg-reader-args-2", action = "append",
 						help = "arguments passed to ffmpeg reader after output. Note: add space in front if it starts with -")
 
 	formatarg = lambda inp: inp.lstrip(".").strip()
 	parser.add_argument("-F", "--format", default = "mp4", type = formatarg, help = "video container to use, default: mp4")
-	parser.add_argument("-I", "--img_format", default = "png", type = formatarg, help = "image container to use, default: png")
-	parser.add_argument("--plain_format", type = formatarg, help = "video container to use for plain files")
+	parser.add_argument("-I", "--img-format", default = "png", type = formatarg, help = "image container to use, default: png")
+	parser.add_argument("--plain-format", type = formatarg, help = "video container to use for plain files")
 
-	parser.add_argument("--name_suffix_org", default = DEFAULT_FRAME_SUFFIX_ORG,
+	parser.add_argument("--name-suffix-org", default = DEFAULT_FRAME_SUFFIX_ORG,
 						help = "suffix (including extension) of original frame names")
-	parser.add_argument("--name_suffix_swapped", default = DEFAULT_FRAME_SUFFIX_SWAPPED,
+	parser.add_argument("--name-suffix-swapped", default = DEFAULT_FRAME_SUFFIX_SWAPPED,
 						help = "suffix (including extension) of original frame names")
 
 	def existing_path(p: str):
@@ -542,32 +567,32 @@ def make_parser():
 			raise argparse.ArgumentTypeError(f"path not found: {p!r}")
 		return path
 
-	parser.add_argument("--frames_dir", type = existing_path, help = "source frames tmp dir")
-	parser.add_argument("--frames_dir_root", type = existing_path, help = "source frames tmp root dir")
+	parser.add_argument("--frames-dir", type = existing_path, help = "source frames tmp dir")
+	parser.add_argument("--frames-dir-root", type = existing_path, help = "source frames tmp root dir")
 
-	parser.add_argument("--swapped_dir", type = Path, help = "swapped tmp dir")
-	parser.add_argument("--swapped_dir_root", type = existing_path, help = "swapped tmp root dir")
+	parser.add_argument("--swapped-dir", type = Path, help = "swapped tmp dir")
+	parser.add_argument("--swapped-dir-root", type = existing_path, help = "swapped tmp root dir")
 
-	parser.add_argument("--work_dir", type = Path, help = "work tmp dir")
-	parser.add_argument("--work_dir_root", type = existing_path, help = "work tmp root dir")
+	parser.add_argument("--work-dir", type = Path, help = "work tmp dir")
+	parser.add_argument("--work-dir-root", type = existing_path, help = "work tmp root dir")
 
-	parser.add_argument("-A", "--no_audio", dest = "vid_output_audio", action = "store_false",
+	parser.add_argument("-A", "--no-audio", dest = "vid_output_audio", action = "store_false",
 						help = "dont try to copy audio from source")
-	parser.add_argument("-P", "--no_plain", dest = "vid_output_plain", action = "store_false",
+	parser.add_argument("-P", "--no-plain", dest = "vid_output_plain", action = "store_false",
 						help = "dont create plaint output video (.plain.mp4 file without original audio)")
-	parser.add_argument("-d", "--direct_audio", action = "store_true",
+	parser.add_argument("-d", "--direct-audio", action = "store_true",
 						help = "add audio directly to output file in one go (instead of plain file and then 2nd separate file with audio merged in)")
 
-	parser.add_argument("-S", "--redo_swapped", action = "store_true",
+	parser.add_argument("-S", "--redo-swapped", action = "store_true",
 						help = "always redo any already swapped images")
 
-	parser.add_argument("-C", "--redo_completed_swap", action = "store_true",
+	parser.add_argument("-C", "--redo-completed-swap", action = "store_true",
 						help = "redo swapping if it has been fully completed")
 
-	parser.add_argument("--max_memory", default = 16, type = int, help = "set max memory")
-	parser.add_argument("--parallel_cpu", type = int, default = max(psutil.cpu_count(logical = True), 1),
+	parser.add_argument("--max-memory", default = 16, type = int, help = "set max memory")
+	parser.add_argument("--parallel-cpu", type = int, default = max(psutil.cpu_count(logical = True), 1),
 						help = "number of cores to use")
-	parser.add_argument("--parallel_gpu", type = int, default = 1,
+	parser.add_argument("--parallel-gpu", type = int, default = 1,
 						help = "number of instance to run in parallel on the GPU, seems faster on some GPU if enough mem")
 
 	parser.add_argument("--ffprobe", default = "ffprobe", help = "ffprobe command/path")
@@ -582,9 +607,14 @@ if __name__ == "__main__":
 		for name, value in vars(parser.parse_args()).items():
 			args[name] = value
 
-		# pre_check()
-		# limit_resources(args)
+		if args["verbose"]:
+			for k, v in args.items():
+				print(f"{k + '':<20} {v!r}")
+			print()
+
 		start(args)
 
 
+	# pre_check()
+	# limit_resources(args)
 	setup()
