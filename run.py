@@ -203,7 +203,7 @@ def start(args):
 
 	if source_path.is_file():
 		if is_img(source_path):
-			process_img(face_path, source_path, output_path, args["overwrite"])
+			process_img(face_path, source_path, output_path, args["multi_face"], args["overwrite"])
 			status("swap successful!")
 			return
 		vid_info = get_video_info(source_path, ffprobe = args["ffprobe"])
@@ -242,9 +242,9 @@ def _split_shell_args(args):
 	return res
 
 
-def _rem_ctx(gen):
-	for ctx, i in gen:
-		yield i
+def _get_face(gen):
+	for ctx, (frame, faces_cnt) in gen:
+		yield frame
 
 
 def process_streamed(
@@ -264,9 +264,9 @@ def process_streamed(
 	# _swap_gen wants each frame to be (some_identifier_or_ctx, frame) so use enumerate to just get pos
 	# and then remove again afterwards for vid_save_gen that just wants frames
 	gen = enumerate(gen)
-	settings = SwapSettings(face_path, False)
+	settings = SwapSettings(face_path, args["multi_face"])
 	gen = parallel_process_gen(args["gpu"], args["parallel_cpu"], args["parallel_gpu"], settings, gen)
-	gen = _rem_ctx(gen)
+	gen = _get_face(gen)
 	vid_save_gen(args, source_path, output_path, vid_info, fps_output, gen)
 
 
@@ -371,6 +371,10 @@ def process_image_mode(
 				workdir = workdir / _workdir_name
 			else:
 				workdir = output_path.with_name(_workdir_name)
+		elif args["work_dir_root"]:
+			workdir = Path(args["work_dir_root"])
+			_workdir_name = f"{source_path.name}.tmp"
+			workdir = workdir / _workdir_name
 		else:
 			workdir = None
 
@@ -386,7 +390,7 @@ def process_image_mode(
 			if not _root:
 				exit(error_exit(
 					"in image-mode without output_path, with video source_path given, "
-					"one of work_dir or frames_dir or frames_dir_root required to extract source_video frames to"
+					"one of work_dir or work_dir_root or frames_dir or frames_dir_root required to extract source_video frames to"
 				))
 			in_frames_dir = _root / f"f_in__{source_path.name}__F{fps_use or 'srcfps'}"
 			if in_frames_dir.exists():
@@ -416,7 +420,7 @@ def process_image_mode(
 			if not _root:
 				exit(error_exit(
 					"in image-mode without output_path, "
-					"one of work_dir or swapped_dir or swapped_dir_root required to write swapped frames to"
+					"one of work_dir or work_dir_root or swapped_dir or swapped_dir_root required to write swapped frames to"
 				))
 			swapped_frames_dir = _root / f"f_swapped__{source_path.name}__F{fps_use or 'srcfps'}"
 			makedir(swapped_frames_dir, exist_ok = True, parents = 2)
@@ -448,8 +452,9 @@ def process_image_mode(
 			except ImportError:
 				fp_todo_use = fp_todo
 
-			settings = SwapSettings(face_path, False)
-			gen = parallel_process_gen(args["gpu"], args["parallel_cpu"], args["parallel_gpu"], settings, fp_todo_use, True)
+			settings = SwapSettings(face_path, args["multi_face"])
+			gen = enumerate(fp_todo_use)
+			gen = parallel_process_gen(args["gpu"], args["parallel_cpu"], args["parallel_gpu"], settings, gen, True)
 			for i in gen:
 				pass
 		else:
@@ -516,6 +521,7 @@ def make_parser():
 	parser.add_argument("-O", "--output-vid-formatted", help = "save output to this file with {} formatting")
 
 	parser.add_argument("-v", "--verbose", action = "store_true")
+	parser.add_argument("-m", "--multi-face", action = "store_true")
 
 	parser.add_argument("--image-mode", action = "store_true",
 						help = "work with directories of images")

@@ -101,39 +101,27 @@ def _setup(settings: ProcessSettings, swap_settings: SwapSettings):
 	return SwState(settings, swap_settings, face, swapper, face_analyser)
 
 
-def process_gen(init_args, frame_gen, process_fn):
-	state = _setup(*init_args)
-	for pos, src_tup in enumerate(frame_gen):
-		res = process_fn(state, src_tup, pos)
-		if res is not None:
-			yield res
-
-
 def process_gen_frame_disk(state: SwState, src_tup):
 	settings = state.settings
-	src_frame_path, target_frame_path = src_tup
+	src_ctx, (src_frame_path, target_frame_path) = src_tup
 	if settings.skip_existing and target_frame_path.exists():
-		res = "R"
-	else:
-		src_frame = cv2.imread(str(src_frame_path))
-		res = process_frame(state.swapper, state.face_analyser, state.face, src_frame)
+		return
 
-	if not isinstance(res, str):
-		is_ok, buffer = cv2.imencode(".png", res)
+	src_frame = cv2.imread(str(src_frame_path))
+	try:
+		frame, faces_cnt = process_frame(state.swapper, state.face_analyser, state.face, src_frame, state.swap_settings.multi_face)
+		is_ok, buffer = cv2.imencode(".png", frame)
 		if not is_ok:
-			logger.error("failed encoding image, %r", type(res))
-			settings.progress("P")
+			logger.error("failed encoding image, %r, %r", src_ctx, type(frame))
 		else:
-			settings.progress(".")
 			write_atomic(buffer, target_frame_path, may_exist = False)
-		del buffer, res
-	else:
-		settings.progress(res)
+	except ProcessingError as ex:
 		error_handling = settings.error_handling
 		if error_handling is ProcErrorHandling.Ignore:
 			return
 
-		logger.info("processing error %r for file %s, %s", res, src_frame_path, error_handling.name)
+		logger.info("processing error %r, ctx %r, files %s, error_handling %s",
+					ex, src_ctx, src_frame_path, error_handling.name)
 		if error_handling is ProcErrorHandling.Symlink:
 			ensure(not target_frame_path.exists(), c = target_frame_path)
 			os.symlink(src_frame_path.absolute(), target_frame_path.absolute())
@@ -144,37 +132,58 @@ def process_gen_frame_disk(state: SwState, src_tup):
 def process_gen_frame(state: SwState, src_tup):
 	settings = state.settings
 	src_ctx, src_frame = src_tup
-	res = process_frame(state.swapper, state.face, src_frame)
-	if not isinstance(res, str):
-		settings.progress(".")
+	try:
+		res = process_frame(state.swapper, state.face_analyser, state.face, src_frame, state.swap_settings.multi_face)
 		return src_ctx, res
-	else:
-		settings.progress(res)
+	except ProcessingError as ex:
 		error_handling = settings.error_handling
 		if error_handling is ProcErrorHandling.Ignore:
-			return
+			return src_ctx, None
 
-		logger.info("processing error %r for frame, %s", res, error_handling.name)
+		logger.info("processing error %r, ctx %r, error_handling %s",
+					ex, src_ctx, error_handling.name)
 		if error_handling is ProcErrorHandling.Copy:
-			return src_tup
+			return src_ctx, (src_frame, 0)
 		else:
-			raise NotImplementedError(res, error_handling)  # TODO
+			raise NotImplementedError(ex, error_handling)  # TODO
 
 
-def process_frame(swapper, face_analyser, source_face, frame):
+class ProcessingError(Exception):
+	pass
+
+
+class NoFaceError(ProcessingError):
+	pass
+
+
+class FaceAnalyzerError(ProcessingError):
+	pass
+
+
+class SwapError(ProcessingError):
+	pass
+
+
+def process_frame(swapper, face_analyser, source_face, frame, multi_face):
 	try:
-		face = get_face(face_analyser, frame)
+		if multi_face:
+			faces = get_faces(face_analyser, frame)
+		else:
+			face = get_face(face_analyser, frame)
+			faces = [face] if face else []
 	except Exception as ex:
-		return "F"
+		raise FaceAnalyzerError(ex)
 
-	if not face:
-		return "S"
+	if not faces:
+		raise NoFaceError()
 
-	try:
-		return swapper.get(frame, face, source_face, paste_back = True)
-	except Exception as ex:
-		traceback.print_exc()
-		return "E"
+	for face in faces:
+		try:
+			frame = swapper.get(frame, face, source_face, paste_back = True)
+		except Exception as ex:
+			raise SwapError(ex)
+
+	return frame, len(faces)
 
 
 _gen_state = None
@@ -188,14 +197,20 @@ def _init_gen_state_global(settings: ProcessSettings, swap_settings: SwapSetting
 	return _gen_state
 
 
-def process_gen_frame_global(proc_fn, tup):
+def process_gen_frame_global(process_fn, tup):
 	global _gen_state
 
 	init_args, src_frame = tup
 	if _gen_state is None:
 		_init_gen_state_global(*init_args)
 
-	return proc_fn(_gen_state, src_frame)
+	return process_fn(_gen_state, src_frame)
+
+
+def process_gen(init_args, frame_gen, process_fn):
+	state = _setup(*init_args)
+	for src_tup in frame_gen:
+		yield process_fn(state, src_tup)
 
 
 def parallel_process_gen(
@@ -207,7 +222,7 @@ def parallel_process_gen(
 	init_args = (settings, swap_settings)
 	procs = procs_gpu if use_gpu else procs_cpu
 
-	proc_fn = process_gen_frame_disk if process_disk else process_gen_frame
+	process_fn = process_gen_frame_disk if process_disk else process_gen_frame
 	if procs > 1:
 		if not use_gpu:
 			import multiprocessing as mp
@@ -225,23 +240,25 @@ def parallel_process_gen(
 				yield init_args, i
 
 		gen = _settings_gen(frame_gen)
-		fn = functools.partial(process_gen_frame_global, proc_fn)
+		fn = functools.partial(process_gen_frame_global, process_fn)
 		gen = pool.imap(fn, gen)
 	else:
-		gen = process_gen(init_args, frame_gen, proc_fn)
+		gen = process_gen(init_args, frame_gen, process_fn)
 
 	return gen
 
 
-def process_img(source_img: Path, frame_path: Path, output_file: Path, may_exist: bool = False):
-	source_face = get_face(cv2.imread(str(source_img)))
+def process_img(
+		face_img: Path, frame_path: Path, output_file: Path, multi_face: bool,
+		may_exist: bool = False,
+):
+	frame = cv2.imread(str(frame_path))
+	face_analyser = get_face_analyser()
+	face = get_face(face_analyser, cv2.imread(str(face_img)))
 	swapper = load_face_swapper()
 
-	frame = cv2.imread(str(frame_path))
-	face = get_face(frame)
-	result = swapper.get(frame, face, source_face, paste_back = True)
-
-	is_ok, buffer = cv2.imencode(".png", result)
+	frame, faces_count = process_frame(swapper, face_analyser, face, frame, multi_face)
+	is_ok, buffer = cv2.imencode(".png", frame)
 	if not is_ok:
 		raise ValueError("failed encoding image??")
 	write_atomic(buffer, output_file, may_exist = may_exist)
