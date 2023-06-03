@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import functools
 import os
 
@@ -11,11 +12,8 @@ from typing import Iterable, Any
 if not os.environ.get("SKIP_EARLY_TORCH") == "1":
 	import torch  # needs to be imported before onnx for GPU support to work easily apparently
 
-import platform
 import re
 import subprocess
-import sys
-import traceback
 
 import argparse
 import os
@@ -24,8 +22,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from core.processor import process_img, ProcessSettings, parallel_process_gen, SwapSettings
-from core.utils import is_img, create_video, add_audio, extract_frames, ensure, Timer, create_video_with_audio, ensure_equal, create_video_from_frame_gen, \
+from core.processor import process_img, parallel_process_gen, SwapSettings
+from core.utils import is_img, add_audio, extract_frames, ensure, Timer, create_video_with_audio, ensure_equal, create_video_from_frame_gen, \
 	tmp_path_move_ctx, str_to_num, get_video_info, VidInfo
 import psutil
 
@@ -38,51 +36,6 @@ DEFAULT_FRAME_SUFFIX_SWAPPED = ".png"
 
 def name_pattern(name: str, length: int = 5):
 	return f"%0{length}d{name}"
-
-
-def limit_resources(args):
-	if args['max_memory'] >= 1:
-		memory = args['max_memory'] * 1024 * 1024 * 1024
-		if str(platform.system()).lower() == 'windows':
-			import ctypes
-			kernel32 = ctypes.windll.kernel32
-			kernel32.SetProcessWorkingSetSize(-1, ctypes.c_size_t(memory), ctypes.c_size_t(memory))
-		else:
-			import resource
-			try:
-				resource.setrlimit(resource.RLIMIT_DATA, (memory, memory))
-			except:
-				traceback.print_exc()
-
-
-def pre_check():
-	import shutil
-	import core.globals
-	import torch
-	if sys.version_info < (3, 8):
-		quit(f'Python version is not supported - please upgrade to 3.8 or higher')
-	if not shutil.which('ffmpeg'):
-		quit('ffmpeg is not installed!')
-	model_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'inswapper_128.onnx')
-	if not os.path.isfile(model_path):
-		quit('File "inswapper_128.onnx" does not exist!')
-	if '--gpu' in sys.argv:
-		CUDA_VERSION = torch.version.cuda
-		CUDNN_VERSION = torch.backends.cudnn.version()
-
-		if 'ROCMExecutionProvider' not in core.globals.providers:
-			if not torch.cuda.is_available() or not CUDA_VERSION:
-				quit("You are using --gpu flag but CUDA isn't available or properly installed on your system.")
-			if CUDA_VERSION > '11.8':
-				quit(f"CUDA version {CUDA_VERSION} is not supported - please downgrade to 11.8.")
-			if CUDA_VERSION < '11.4':
-				quit(f"CUDA version {CUDA_VERSION} is not supported - please upgrade to 11.8")
-			if CUDNN_VERSION < 8220:
-				quit(f"CUDNN version {CUDNN_VERSION} is not supported - please upgrade to 8.9.1")
-			if CUDNN_VERSION > 8910:
-				quit(f"CUDNN version {CUDNN_VERSION} is not supported - please downgrade to 8.9.1")
-	else:
-		core.globals.providers = ['CPUExecutionProvider']
 
 
 def _frames(frame_paths: list[Path], output_dir: Path, org_suffix: str, swapped_suffix: str) \
@@ -275,7 +228,8 @@ def vid_save_gen(args, source_path: Path, output_path: Path, vid_info: VidInfo, 
 
 	_tmp_file_ctx = functools.partial(tmp_path_move_ctx, trail_org_ext = True, overwrite = overwrite, overwrite_delete_tmp = overwrite)
 	with _tmp_file_ctx(output_path_write) as tmp_path:
-		ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info", *_split_shell_args(args["out_ff_args"])])
+		pos_args = _parse_ffmpeg_args(args["ffmpeg_writer_args"] or [], fill = True)
+		ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info"], pos_args = pos_args)
 		create_video_from_frame_gen(
 			frame_gen, vid_info.width, vid_info.height, fps_output, tmp_path,
 			preset = args["preset"], crf = args["crf"], audio_source_path = audio_source_path, audio_shortest = args["audio_shortest"],
@@ -285,7 +239,7 @@ def vid_save_gen(args, source_path: Path, output_path: Path, vid_info: VidInfo, 
 	if audio_2stage:
 		ensure(output_path != output_path_write)
 		with _tmp_file_ctx(output_path) as tmp_path:
-			ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info", *_split_shell_args(args["audio_ff_args"])])
+			ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info"])
 			add_audio(output_path_write, source_path, tmp_path, shortest = args["audio_shortest"], **ffmpeg)
 
 
@@ -311,6 +265,19 @@ def _video_save(args, source_path: Path, output_path: Path, vid_info: VidInfo):
 	return output_path_gen, audio_source_path, audio_2stage, overwrite
 
 
+def _parse_ffmpeg_args(ffmpeg_arg_list: list[tuple[str, str]], fill: bool | Iterable[int] = None) -> dict[int, list[str]]:
+	by_num = collections.defaultdict(list) if fill is True else { }
+	if fill and fill is not True:
+		for i in fill or []:
+			by_num.setdefault(i, [])
+
+	for num, argument in ffmpeg_arg_list:
+		if argument.strip():
+			by_num.setdefault(int(num), []).extend(shlex.split(argument))
+
+	return by_num
+
+
 def _frame_gen_ffmpeg(args, source_path: Path, width, height, fps_to_output: int | float | None, ):
 	ensure(width and height, c = (width, height))
 
@@ -318,14 +285,17 @@ def _frame_gen_ffmpeg(args, source_path: Path, width, height, fps_to_output: int
 	ffmpeg = [args["ffmpeg"], "-hide_banner", "-loglevel", "info"]
 	fps = ["-filter:v", f"fps=fps={fps_to_output}"] if fps_to_output else []
 
+	pos_args = _parse_ffmpeg_args(args["ffmpeg_reader_args"] or [], fill = True)
 	com = [
 		*ffmpeg,
-		*_split_shell_args(args["ffmpeg_reader_args_0"]),
+		*pos_args[0],
 		"-i", str(source_path),
-		*_split_shell_args(args["ffmpeg_reader_args_1"]),
+		*pos_args[1],
 		*fps,
-		"-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:",
-		*_split_shell_args(args["ffmpeg_reader_args_2"]),
+		"-pix_fmt", "bgr24", "-f", "rawvideo",
+		*pos_args[2],
+		"pipe:",
+		*pos_args[3],
 	]
 	print("com", repr(com))
 	proc = subprocess.Popen(com, stdout = subprocess.PIPE, bufsize = 128 * 1024 ** 2)
@@ -473,7 +443,8 @@ def vid_save_frames(args, swapped_frames_dir: Path, source_path: Path, output_pa
 	swapped_pat = name_pattern(args["name_suffix_swapped"])
 	_tmp_file_ctx = functools.partial(tmp_path_move_ctx, trail_org_ext = True, overwrite = overwrite, overwrite_delete_tmp = overwrite)
 	with _tmp_file_ctx(output_path_write) as tmp_path:
-		ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info", *_split_shell_args(args["out_ff_args"])])
+		pos_args = _parse_ffmpeg_args(args["ffmpeg_writer_args"] or [], fill = True)
+		ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info", ], pos_args = pos_args)
 		create_video_with_audio(
 			swapped_frames_dir, fps_output, tmp_path,
 			audio_source_path = audio_source_path, audio_shortest = args["audio_shortest"],
@@ -485,7 +456,7 @@ def vid_save_frames(args, swapped_frames_dir: Path, source_path: Path, output_pa
 	if audio_2stage:
 		ensure(output_path != output_path_write)
 		with _tmp_file_ctx(output_path) as tmp_path:
-			ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info", *_split_shell_args(args["audio_ff_args"])])
+			ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info"])
 			add_audio(output_path_write, source_path, tmp_path, shortest = args["audio_shortest"], **ffmpeg)
 
 
@@ -550,25 +521,21 @@ def make_parser():
 						help = "output crf")
 	parser.add_argument("--preset", default = "superfast",
 						help = "output preset")
-	parser.add_argument("--out-ff-args", action = "append",
-						help = "extra output ffmpeg args")
 	parser.add_argument("--audio-ff-args", action = "append",
 						help = "extra audio merging ffmpeg args")
 
 	parser.add_argument("--audio-shortest", action = "store_true",
 						help = "shorten audio file to vid length, should only be needed if seeking with -XYZ")
 
-	parser.add_argument("-R", "--ffmpeg-reader", action = "store_true",
+	parser.add_argument("--ffmpeg-reader", action = "store_true",
 						help = "always use ffmpeg source reader")
 	parser.add_argument("--cv2-reader", action = "store_true",
 						help = "always use opencv source reader")
 
-	parser.add_argument("-X", "--ffmpeg-reader-args-0", action = "append",
-						help = "arguments passed to ffmpeg reader in front of args. Note: add space in front if it starts with -")
-	parser.add_argument("-Y", "--ffmpeg-reader-args-1", action = "append",
+	parser.add_argument("-R", "--ffmpeg-reader-args", nargs = 2, action = "append",
+						help = "format: position_idx argument. arguments passed to ffmpeg reader. Note: add space in front if it starts with -")
+	parser.add_argument("-W", "--ffmpeg-writer-args", nargs = 2, action = "append",
 						help = "arguments passed to ffmpeg reader after input. Note: add space in front if it starts with -")
-	parser.add_argument("-Z", "--ffmpeg-reader-args-2", action = "append",
-						help = "arguments passed to ffmpeg reader after output. Note: add space in front if it starts with -")
 
 	formatarg = lambda inp: inp.lstrip(".").strip()
 	parser.add_argument("-F", "--format", default = "mp4", type = formatarg, help = "video container to use, default: mp4")
@@ -634,6 +601,4 @@ if __name__ == "__main__":
 		start(args)
 
 
-	# pre_check()
-	# limit_resources(args)
 	setup()

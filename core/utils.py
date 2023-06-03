@@ -110,30 +110,35 @@ def create_video_from_frame_gen(
 		audio_source_path: Path | str | None = None, audio_shortest: bool = False,
 		crf: int | None = None, preset: str | None = None,
 		finish_timeout = 10, check = True,
-		ffmpeg = "ffmpeg", extra_args = None,
+		ffmpeg = "ffmpeg", extra_args = None, pos_args: dict[int, list[str]] | None = None,
 ):
 
 	preset = ["-preset", preset] if preset else []
 	crf = ["-crf", str(crf)] if crf else []
 
+	pos_args = pos_args or { }
 	audio = []
 	if audio_source_path is not None:
 		audio = [
 			"-i", str(audio_source_path),
 			*(["-shortest"] if audio_shortest else []),
+			*(pos_args.get(2) or []),
 			"-map", "0:v:0", "-map", "1:a:0",
 		]
 
-	proc = subprocess.Popen([
+	com = [
 		ffmpeg, "-n", *(extra_args or []),
+		*(pos_args.get(0) or []),
 		'-f', 'rawvideo', "-pix_fmt", "bgr24", "-video_size", f"{width}x{height}", "-framerate", str(fps), '-i', '-',
+		*(pos_args.get(1) or []),
 		*audio,
-		"-c:v", "libx264", *preset, *crf, "-pix_fmt", "yuv420p",
-		"-r", str(fps),
+		*(pos_args.get(3) or []),
+		"-c:v", "libx264", *preset, *crf, "-pix_fmt", "yuv420p", "-r", str(fps),
+		*(pos_args.get(4) or []),
 		str(target),
-	],
-		stdin = subprocess.PIPE
-	)
+		*(pos_args.get(5) or []),
+	]
+	proc = subprocess.Popen(com, stdin = subprocess.PIPE)
 
 	for pos, frame_buf in enumerate(frame_gen):
 		proc.stdin.write(frame_buf)
@@ -152,35 +157,7 @@ def add_audio(video_path: Path, audio_source_path: Path, target_path: Path, ffmp
 		"-i", str(audio_source_path),
 		*(["-shortest"] if shortest else []),
 		"-c:v", "copy", "-map", "0:v:0", "-map", "1:a:0",
-		str(target_path)
-	])
-
-
-def create_video(
-		frames_dir: Path, fps: int | float, target: Path,
-		audio_source_path: Path | str | None = None, audio_shortest: bool = False,
-		filename_pattern = "%05d.png",
-		crf: int | None = None, preset: str | None = None,
-		ffmpeg = "ffmpeg", extra_args = None,
-):
-	preset = ["-preset", preset] if preset else []
-	crf = ["-crf", str(crf)] if crf else []
-
-	audio = []
-	if audio_source_path is not None:
-		audio = [
-			"-i", str(audio_source_path),
-			*(["-shortest"] if audio_shortest else []),
-			"-map", "0:v:0", "-map", "1:a:0",
-		]
-
-	subprocess.check_output([
-		ffmpeg, "-n", *(extra_args or []),
-		"-framerate", str(fps),
-		"-i", str(frames_dir / filename_pattern),
-		*audio,
-		"-c:v", "libx264", *preset, *crf, "-pix_fmt", "yuv420p",
-		str(target)
+		str(target_path),
 	])
 
 
@@ -189,27 +166,35 @@ def create_video_with_audio(
 		audio_source_path: Path | str = None, audio_shortest: bool = False,
 		filename_pattern = "%05d.png",
 		crf: int | None = None, preset: str | None = None,
-		ffmpeg = "ffmpeg", extra_args = None,
+		ffmpeg = "ffmpeg", extra_args = None, pos_args: dict[int, list[str]] | None = None,
 ):
 	preset = ["-preset", preset] if preset else []
 	crf = ["-crf", str(crf)] if crf else []
 
+	pos_args = pos_args or { }
 	audio = []
 	if audio_source_path is not None:
 		audio = [
 			"-i", str(audio_source_path),
 			*(["-shortest"] if audio_shortest else []),
+			*(pos_args.get(2) or []),
 			"-map", "0:v:0", "-map", "1:a:0",
 		]
 
-	subprocess.check_output([
+	com = [
 		ffmpeg, "-n", *(extra_args or []),
+		*(pos_args.get(0) or []),
 		"-framerate", str(fps),
 		"-i", str(frames_dir / filename_pattern),
+		*(pos_args.get(1) or []),
 		*audio,
+		*(pos_args.get(3) or []),
 		"-c:v", "libx264", *preset, *crf, "-pix_fmt", "yuv420p",
-		str(target)
-	])
+		*(pos_args.get(4) or []),
+		str(target),
+		*(pos_args.get(5) or []),
+	]
+	subprocess.check_output(com)
 
 
 def noop(*args, **kwargs):
