@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import logging
+import os
+if not os.environ.get("SKIP_EARLY_TORCH") == "1":
+	import torch  # needs to be imported before onnx for GPU support to work easily apparently
+
 import collections
 import functools
-import os
 
 import shlex
 from typing import Iterable, Any
 
-if not os.environ.get("SKIP_EARLY_TORCH") == "1":
-	import torch  # needs to be imported before onnx for GPU support to work easily apparently
 
 import re
 import subprocess
@@ -156,7 +158,7 @@ def start(args):
 
 	if source_path.is_file():
 		if is_img(source_path):
-			process_img(face_path, source_path, output_path, args["multi_face"], args["overwrite"])
+			process_img(face_path, source_path, output_path, args["gpu"], args["multi_face"], args["overwrite"])
 			status("swap successful!")
 			return
 		vid_info = get_video_info(source_path, ffprobe = args["ffprobe"])
@@ -593,6 +595,7 @@ if __name__ == "__main__":
 		for name, value in vars(parser.parse_args()).items():
 			args[name] = value
 
+		logging.basicConfig(level = logging.DEBUG if args["verbose"] else logging.INFO)
 		if args["verbose"]:
 			for k, v in args.items():
 				print(f"{k + '':<20} {v!r}")

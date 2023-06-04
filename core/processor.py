@@ -1,33 +1,72 @@
 from __future__ import annotations
 
+import os
 import builtins
 import dataclasses
 import functools
-import os
-import traceback
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable
+from core.utils import write_atomic, ensure, noop
 
 import cv2
+import onnxruntime
 import insightface
-from core.utils import write_atomic, ensure, noop
-import core.globals
-
-FACE_SWAPPER = None
-FACE_ANALYSER = None
 
 import logging as _logging
 
 logger = _logging.getLogger(__name__)
 
+FACE_SWAPPER = None
+FACE_ANALYSER = None
 
-def get_face_analyser():
+
+def get_default_providers():
+	return onnxruntime.get_available_providers()
+
+
+def get_cpu_providers():
+	return ['CPUExecutionProvider']
+
+
+def get_model(model_file, local: bool, **kwargs):
+	from insightface.model_zoo.model_zoo import PickableInferenceSession
+
+	providers = kwargs.get('providers', get_default_providers())
+	provider_options = kwargs.get('provider_options', None)
+	session = PickableInferenceSession(model_file, providers = providers, provider_options = provider_options)
+
+	if local:
+		# print("loading local_model")
+		from inswapper_local import INSwapper as model
+	else:
+		# print("loading modelzoo")
+		from insightface.model_zoo.inswapper import INSwapper as model
+
+	return model(model_file = model_file, session = session)
+
+
+def get_face_analyser(settings: ProcessSettings):
 	global FACE_ANALYSER
 	if FACE_ANALYSER is None:
-		FACE_ANALYSER = insightface.app.FaceAnalysis(name = 'buffalo_l', providers = core.globals.providers)
+		providers = get_cpu_providers() if settings.cpu else get_default_providers()
+		FACE_ANALYSER = insightface.app.FaceAnalysis(name = 'buffalo_l', providers = providers)
 		FACE_ANALYSER.prepare(ctx_id = 0, det_size = (640, 640))
 	return FACE_ANALYSER
+
+
+def load_face_swapper(settings: ProcessSettings):
+	model_path = '../inswapper_128.onnx'
+	model_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), model_path)
+	providers = get_cpu_providers() if settings.cpu else get_default_providers()
+	return get_model(model_path, settings.local_model, providers = providers)
+
+
+def get_face_swapper(settings: ProcessSettings):
+	global FACE_SWAPPER
+	if FACE_SWAPPER is None:
+		FACE_SWAPPER = load_face_swapper(settings)
+	return FACE_SWAPPER
 
 
 def get_face(face_analyser, img_data):
@@ -42,18 +81,6 @@ def get_faces(face_analyser, img_data):
 	return face_analyser.get(img_data)
 
 
-def load_face_swapper():
-	model_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), '../inswapper_128.onnx')
-	return insightface.model_zoo.get_model(model_path, providers = core.globals.providers)
-
-
-def get_face_swapper():
-	global FACE_SWAPPER
-	if FACE_SWAPPER is None:
-		FACE_SWAPPER = load_face_swapper()
-	return FACE_SWAPPER
-
-
 class ProcErrorHandling(Enum):
 	Log = 1
 	Ignore = 2
@@ -65,7 +92,9 @@ class ProcErrorHandling(Enum):
 @dataclasses.dataclass
 class ProcessSettings():
 	load_own_model: bool
-	skip_existing: bool
+	cpu: bool
+	skip_existing: bool = False
+	local_model: bool = False
 	error_handling: ProcErrorHandling = ProcErrorHandling.Log
 	progprint: Any = builtins.print
 
@@ -89,14 +118,14 @@ class SwapSettings():
 
 
 def _setup(settings: ProcessSettings, swap_settings: SwapSettings):
-	face_analyser = get_face_analyser()
+	face_analyser = get_face_analyser(settings)
 	face = get_face(face_analyser, cv2.imread(str(swap_settings.face_path)))
 
 	if settings.load_own_model:
 		# needed to run multiple at the same time on the GPU, seems to give better utilization on some
-		swapper = load_face_swapper()
+		swapper = load_face_swapper(settings)
 	else:
-		swapper = get_face_swapper()
+		swapper = get_face_swapper(settings)
 
 	return SwState(settings, swap_settings, face, swapper, face_analyser)
 
@@ -120,7 +149,8 @@ def process_gen_frame_disk(state: SwState, src_tup):
 		if error_handling is ProcErrorHandling.Ignore:
 			return
 
-		logger.info("processing error %r, ctx %r, files %s, error_handling %s",
+		log = logger.debug if isinstance(ex, NoFaceError) else logger.info
+		log("processing error %r, ctx %r, files %s, error_handling %s",
 					ex, src_ctx, src_frame_path, error_handling.name)
 		if error_handling is ProcErrorHandling.Symlink:
 			ensure(not target_frame_path.exists(), c = target_frame_path)
@@ -140,8 +170,10 @@ def process_gen_frame(state: SwState, src_tup):
 		if error_handling is ProcErrorHandling.Ignore:
 			return src_ctx, None
 
-		logger.info("processing error %r, ctx %r, error_handling %s",
-					ex, src_ctx, error_handling.name)
+		log = logger.debug if isinstance(ex, NoFaceError) else logger.info
+		log("processing error %r, ctx %r, error_handling %s",
+					 ex, src_ctx, error_handling.name)
+
 		if error_handling is ProcErrorHandling.Copy:
 			return src_ctx, (src_frame, 0)
 		else:
@@ -218,7 +250,7 @@ def parallel_process_gen(
 		process_disk = False,
 ):
 	print(f"{procs_cpu=} {procs_gpu=} {use_gpu=}")
-	settings = ProcessSettings(True, False, ProcErrorHandling.Copy, noop)
+	settings = ProcessSettings(True, not use_gpu, False, False, ProcErrorHandling.Copy, noop)
 	init_args = (settings, swap_settings)
 	procs = procs_gpu if use_gpu else procs_cpu
 
@@ -249,13 +281,16 @@ def parallel_process_gen(
 
 
 def process_img(
-		face_img: Path, frame_path: Path, output_file: Path, multi_face: bool,
+		face_img: Path, frame_path: Path, output_file: Path,
+		gpu: bool, multi_face: bool,
 		may_exist: bool = False,
 ):
+	settings = ProcessSettings(False, not gpu)
 	frame = cv2.imread(str(frame_path))
-	face_analyser = get_face_analyser()
+
+	face_analyser = get_face_analyser(settings)
 	face = get_face(face_analyser, cv2.imread(str(face_img)))
-	swapper = load_face_swapper()
+	swapper = load_face_swapper(settings)
 
 	frame, faces_count = process_frame(swapper, face_analyser, face, frame, multi_face)
 	is_ok, buffer = cv2.imencode(".png", frame)
