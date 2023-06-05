@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import logging
 import os
+
 if not os.environ.get("SKIP_EARLY_TORCH") == "1":
 	import torch  # needs to be imported before onnx for GPU support to work easily apparently
 
 import collections
 import functools
 
-import shlex
 from typing import Iterable, Any
-
+import shlex
 
 import re
 import subprocess
@@ -29,11 +29,12 @@ from core.utils import is_img, add_audio, extract_frames, ensure, Timer, create_
 	tmp_path_move_ctx, str_to_num, get_video_info, VidInfo
 import psutil
 
-# DEFAULT_FRAME_SUFFIX_ORG = "_org.png"
-# DEFAULT_FRAME_SUFFIX_SWAPPED = "_swapped.png"
-
 DEFAULT_FRAME_SUFFIX_ORG = ".png"
 DEFAULT_FRAME_SUFFIX_SWAPPED = ".png"
+
+
+def no_tmp_ctx(arg):
+	return arg
 
 
 def name_pattern(name: str, length: int = 5):
@@ -158,7 +159,7 @@ def start(args):
 
 	if source_path.is_file():
 		if is_img(source_path):
-			process_img(face_path, source_path, output_path, args["gpu"], args["multi_face"], args["overwrite"])
+			process_img(face_path, source_path, output_path, args["gpu"], args["multi_face"], args["local"], overwrite = args["overwrite"])
 			status("swap successful!")
 			return
 		vid_info = get_video_info(source_path, ffprobe = args["ffprobe"])
@@ -219,8 +220,8 @@ def process_streamed(
 	# _swap_gen wants each frame to be (some_identifier_or_ctx, frame) so use enumerate to just get pos
 	# and then remove again afterwards for vid_save_gen that just wants frames
 	gen = enumerate(gen)
-	settings = SwapSettings(face_path, args["multi_face"])
-	gen = parallel_process_gen(args["gpu"], args["parallel_cpu"], args["parallel_gpu"], settings, gen)
+	settings = SwapSettings(face_path, args["multi_face"], args["local"], args["gpu"], args["parallel_cpu"], args["parallel_gpu"])
+	gen = parallel_process_gen(settings, gen)
 	gen = _get_face(gen)
 	vid_save_gen(args, source_path, output_path, vid_info, fps_output, gen)
 
@@ -229,6 +230,7 @@ def vid_save_gen(args, source_path: Path, output_path: Path, vid_info: VidInfo, 
 	output_path_write, audio_source_path, audio_2stage, overwrite = _video_save(args, source_path, output_path, vid_info)
 
 	_tmp_file_ctx = functools.partial(tmp_path_move_ctx, trail_org_ext = True, overwrite = overwrite, overwrite_delete_tmp = overwrite)
+	_tmp_file_ctx = no_tmp_ctx if args["no_tmp"] else _tmp_file_ctx
 	with _tmp_file_ctx(output_path_write) as tmp_path:
 		pos_args = _parse_ffmpeg_args(args["ffmpeg_writer_args"] or [], fill = True)
 		ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info"], pos_args = pos_args)
@@ -424,9 +426,9 @@ def process_image_mode(
 			except ImportError:
 				fp_todo_use = fp_todo
 
-			settings = SwapSettings(face_path, args["multi_face"])
+			settings = SwapSettings(face_path, args["multi_face"], args["local"], args["gpu"], args["parallel_cpu"], args["parallel_gpu"])
 			gen = enumerate(fp_todo_use)
-			gen = parallel_process_gen(args["gpu"], args["parallel_cpu"], args["parallel_gpu"], settings, gen, True)
+			gen = parallel_process_gen(settings, gen, True)
 			for i in gen:
 				pass
 		else:
@@ -444,6 +446,7 @@ def vid_save_frames(args, swapped_frames_dir: Path, source_path: Path, output_pa
 
 	swapped_pat = name_pattern(args["name_suffix_swapped"])
 	_tmp_file_ctx = functools.partial(tmp_path_move_ctx, trail_org_ext = True, overwrite = overwrite, overwrite_delete_tmp = overwrite)
+	_tmp_file_ctx = no_tmp_ctx if args["no_tmp"] else _tmp_file_ctx
 	with _tmp_file_ctx(output_path_write) as tmp_path:
 		pos_args = _parse_ffmpeg_args(args["ffmpeg_writer_args"] or [], fill = True)
 		ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info", ], pos_args = pos_args)
@@ -506,7 +509,13 @@ def make_parser():
 	parser.add_argument("-v", "--verbose", action = "store_true")
 	parser.add_argument("-m", "--multi-face", action = "store_true")
 
+	parser.add_argument("-l", "--local", action = "store_true",
+						help = "always use opencv source reader")
+
 	parser.add_argument("--image-mode", action = "store_true",
+						help = "work with directories of images")
+
+	parser.add_argument("--no-tmp", action = "store_true",
 						help = "work with directories of images")
 
 	parser.add_argument("-y", "--overwrite", action = "store_true", help = "save output to this file with {} formatting")
@@ -604,4 +613,5 @@ if __name__ == "__main__":
 		start(args)
 
 
+	limit()
 	setup()

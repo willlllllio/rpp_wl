@@ -109,7 +109,7 @@ def create_video_from_frame_gen(
 		frame_gen: Iterable[bytes], width: int, height: int, fps: int | float, target: Path,
 		audio_source_path: Path | str | None = None, audio_shortest: bool = False,
 		crf: int | None = None, preset: str | None = None,
-		finish_timeout = 10, check = True,
+		finish_timeout = 60, check = True,
 		ffmpeg = "ffmpeg", extra_args = None, pos_args: dict[int, list[str]] | None = None,
 ):
 
@@ -127,7 +127,7 @@ def create_video_from_frame_gen(
 		]
 
 	com = [
-		ffmpeg, "-n", *(extra_args or []),
+		ffmpeg, "-n" if str(target) != "/dev/null" else "-y", *(extra_args or []),
 		*(pos_args.get(0) or []),
 		'-f', 'rawvideo', "-pix_fmt", "bgr24", "-video_size", f"{width}x{height}", "-framerate", str(fps), '-i', '-',
 		*(pos_args.get(1) or []),
@@ -138,7 +138,7 @@ def create_video_from_frame_gen(
 		str(target),
 		*(pos_args.get(5) or []),
 	]
-	proc = subprocess.Popen(com, stdin = subprocess.PIPE)
+	proc = subprocess.Popen(com, stdin = subprocess.PIPE, bufsize = 16 * 1024 ** 2)
 
 	for pos, frame_buf in enumerate(frame_gen):
 		proc.stdin.write(frame_buf)

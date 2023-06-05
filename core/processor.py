@@ -6,7 +6,9 @@ import dataclasses
 import functools
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Callable
+
+from core.mp_utils import imap_backpressure
 from core.utils import write_atomic, ensure, noop
 
 import cv2
@@ -49,7 +51,7 @@ def get_model(model_file, local: bool, **kwargs):
 def get_face_analyser(settings: ProcessSettings):
 	global FACE_ANALYSER
 	if FACE_ANALYSER is None:
-		providers = get_cpu_providers() if settings.cpu else get_default_providers()
+		providers = get_default_providers() if settings.swap_settings.use_gpu else get_cpu_providers()
 		FACE_ANALYSER = insightface.app.FaceAnalysis(name = 'buffalo_l', providers = providers)
 		FACE_ANALYSER.prepare(ctx_id = 0, det_size = (640, 640))
 	return FACE_ANALYSER
@@ -58,8 +60,8 @@ def get_face_analyser(settings: ProcessSettings):
 def load_face_swapper(settings: ProcessSettings):
 	model_path = '../inswapper_128.onnx'
 	model_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), model_path)
-	providers = get_cpu_providers() if settings.cpu else get_default_providers()
-	return get_model(model_path, settings.local_model, providers = providers)
+	providers = get_default_providers() if settings.swap_settings.use_gpu else get_cpu_providers()
+	return get_model(model_path, settings.swap_settings.local_model, providers = providers)
 
 
 def get_face_swapper(settings: ProcessSettings):
@@ -92,9 +94,8 @@ class ProcErrorHandling(Enum):
 @dataclasses.dataclass
 class ProcessSettings():
 	load_own_model: bool
-	cpu: bool
+	swap_settings: SwapSettings
 	skip_existing: bool = False
-	local_model: bool = False
 	error_handling: ProcErrorHandling = ProcErrorHandling.Log
 	progprint: Any = builtins.print
 
@@ -115,6 +116,10 @@ class SwState():
 class SwapSettings():
 	face_path: Path
 	multi_face: bool
+	local_model: bool
+	use_gpu: bool
+	procs_cpu: int
+	procs_gpu: int
 
 
 def _setup(settings: ProcessSettings, swap_settings: SwapSettings):
@@ -122,7 +127,6 @@ def _setup(settings: ProcessSettings, swap_settings: SwapSettings):
 	face = get_face(face_analyser, cv2.imread(str(swap_settings.face_path)))
 
 	if settings.load_own_model:
-		# needed to run multiple at the same time on the GPU, seems to give better utilization on some
 		swapper = load_face_swapper(settings)
 	else:
 		swapper = get_face_swapper(settings)
@@ -151,7 +155,7 @@ def process_gen_frame_disk(state: SwState, src_tup):
 
 		log = logger.debug if isinstance(ex, NoFaceError) else logger.info
 		log("processing error %r, ctx %r, files %s, error_handling %s",
-					ex, src_ctx, src_frame_path, error_handling.name)
+			ex, src_ctx, src_frame_path, error_handling.name)
 		if error_handling is ProcErrorHandling.Symlink:
 			ensure(not target_frame_path.exists(), c = target_frame_path)
 			os.symlink(src_frame_path.absolute(), target_frame_path.absolute())
@@ -172,7 +176,7 @@ def process_gen_frame(state: SwState, src_tup):
 
 		log = logger.debug if isinstance(ex, NoFaceError) else logger.info
 		log("processing error %r, ctx %r, error_handling %s",
-					 ex, src_ctx, error_handling.name)
+			ex, src_ctx, error_handling.name)
 
 		if error_handling is ProcErrorHandling.Copy:
 			return src_ctx, (src_frame, 0)
@@ -222,7 +226,7 @@ _gen_state = None
 
 
 def _init_gen_state_global(settings: ProcessSettings, swap_settings: SwapSettings):
-	# print("_init_gen_state_global", os.getpid(), os.getppid())
+	print("_init_gen_state_global", os.getpid(), os.getppid())
 	global _gen_state
 	ensure(_gen_state is None)
 	_gen_state = _setup(settings, swap_settings)
@@ -232,9 +236,9 @@ def _init_gen_state_global(settings: ProcessSettings, swap_settings: SwapSetting
 def process_gen_frame_global(process_fn, tup):
 	global _gen_state
 
-	init_args, src_frame = tup
+	src_frame = tup
 	if _gen_state is None:
-		_init_gen_state_global(*init_args)
+		raise ValueError("no gen state")
 
 	return process_fn(_gen_state, src_frame)
 
@@ -245,35 +249,34 @@ def process_gen(init_args, frame_gen, process_fn):
 		yield process_fn(state, src_tup)
 
 
-def parallel_process_gen(
-		use_gpu: bool, procs_cpu: int, procs_gpu: int, swap_settings: SwapSettings, frame_gen,
-		process_disk = False,
-):
-	print(f"{procs_cpu=} {procs_gpu=} {use_gpu=}")
-	settings = ProcessSettings(True, not use_gpu, False, False, ProcErrorHandling.Copy, noop)
+def _passthrough(i):
+	return i[1][0], (i[1][1], 0)
+
+
+def parallel_process_gen(swap_settings: SwapSettings, frame_gen, process_disk = False):
+	print(f"main proc {os.getpid()}")
+	print(f"procs_cpu={swap_settings.procs_cpu} use_gpu={swap_settings.use_gpu} procs_gpu={swap_settings.procs_gpu} ")
+	settings = ProcessSettings(True, swap_settings, False, ProcErrorHandling.Copy, noop)
 	init_args = (settings, swap_settings)
-	procs = procs_gpu if use_gpu else procs_cpu
+	procs = swap_settings.procs_gpu if swap_settings.use_gpu else swap_settings.procs_cpu
 
 	process_fn = process_gen_frame_disk if process_disk else process_gen_frame
 	if procs > 1:
-		if not use_gpu:
+		gen = frame_gen
+		fn = functools.partial(process_gen_frame_global, process_fn)
+
+		if not swap_settings.use_gpu:
 			import multiprocessing as mp
+			pool = mp.Pool(procs, initializer = _init_gen_state_global, initargs = init_args)
+			gen = pool.imap(fn, gen)
 		else:
 			import multiprocessing.dummy as mp
 			# Multiple parallel runs on GPU, can do just with threads.
 			# init here since the init later isn't threadsafe and might be done multiple times unnecessarily,
 			# not an issue with actual multiprocess.
 			_init_gen_state_global(*init_args)
-
-		pool = mp.Pool(procs)
-
-		def _settings_gen(gen):
-			for i in gen:
-				yield init_args, i
-
-		gen = _settings_gen(frame_gen)
-		fn = functools.partial(process_gen_frame_global, process_fn)
-		gen = pool.imap(fn, gen)
+			pool = mp.Pool(procs)
+			gen = imap_backpressure(pool.imap, fn, gen, procs + 30, 0.01, procs * 2 + 10, 0.01)
 	else:
 		gen = process_gen(init_args, frame_gen, process_fn)
 
@@ -282,10 +285,11 @@ def parallel_process_gen(
 
 def process_img(
 		face_img: Path, frame_path: Path, output_file: Path,
-		gpu: bool, multi_face: bool,
-		may_exist: bool = False,
+		gpu: bool, multi_face: bool, local_model: bool,
+		overwrite: bool = False,
 ):
-	settings = ProcessSettings(False, not gpu)
+	swap_settings = SwapSettings(None, multi_face, local_model, gpu, 1, 1)
+	settings = ProcessSettings(False, swap_settings, False)
 	frame = cv2.imread(str(frame_path))
 
 	face_analyser = get_face_analyser(settings)
@@ -296,4 +300,4 @@ def process_img(
 	is_ok, buffer = cv2.imencode(".png", frame)
 	if not is_ok:
 		raise ValueError("failed encoding image??")
-	write_atomic(buffer, output_file, may_exist = may_exist)
+	write_atomic(buffer, output_file, may_exist = overwrite)
