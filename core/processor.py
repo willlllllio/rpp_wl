@@ -31,6 +31,15 @@ def get_cpu_providers():
 	return ['CPUExecutionProvider']
 
 
+def get_face_analyser(settings: ProcessSettings):
+	global FACE_ANALYSER
+	if FACE_ANALYSER is None:
+		providers = get_default_providers() if settings.swap_settings.use_gpu else get_cpu_providers()
+		FACE_ANALYSER = insightface.app.FaceAnalysis(name = 'buffalo_l', providers = providers)
+		FACE_ANALYSER.prepare(ctx_id = 0, det_size = (640, 640))
+	return FACE_ANALYSER
+
+
 def get_model(model_file, local: bool, **kwargs):
 	from insightface.model_zoo.model_zoo import PickableInferenceSession
 
@@ -40,21 +49,12 @@ def get_model(model_file, local: bool, **kwargs):
 
 	if local:
 		# print("loading local_model")
-		from inswapper_local import INSwapper as model
+		from core.inswapper_local import INSwapper as model
 	else:
 		# print("loading modelzoo")
 		from insightface.model_zoo.inswapper import INSwapper as model
 
 	return model(model_file = model_file, session = session)
-
-
-def get_face_analyser(settings: ProcessSettings):
-	global FACE_ANALYSER
-	if FACE_ANALYSER is None:
-		providers = get_default_providers() if settings.swap_settings.use_gpu else get_cpu_providers()
-		FACE_ANALYSER = insightface.app.FaceAnalysis(name = 'buffalo_l', providers = providers)
-		FACE_ANALYSER.prepare(ctx_id = 0, det_size = (640, 640))
-	return FACE_ANALYSER
 
 
 def load_face_swapper(settings: ProcessSettings):
