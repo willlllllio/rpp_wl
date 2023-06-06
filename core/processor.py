@@ -51,17 +51,48 @@ def get_model(model_file, local: bool, **kwargs):
 		# print("loading local_model")
 		from core.inswapper_local import INSwapper as model
 	else:
-		# print("loading modelzoo")
+		# print("loading modelzoo model")
 		from insightface.model_zoo.inswapper import INSwapper as model
 
 	return model(model_file = model_file, session = session)
 
 
+def load_face_swapper_torch(settings: ProcessSettings):
+	from core.model_torch import FaceSwapper
+	from core.model_torch_swapper import TorchINSwapper
+	import torch
+
+	if settings.swap_settings.model_path:
+		model_path = settings.swap_settings.model_path
+	else:
+		model_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "../inswapper_128.torch.safetensors")
+		if not os.path.isfile(model_path):
+			model_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "../inswapper_128.torch.ckpt")
+
+	model_path = str(model_path)
+	if model_path.endswith(".safetensors"):
+		import safetensors.torch
+		sd = safetensors.torch.load_file(model_path)
+	else:
+		sd = torch.load(model_path)
+
+	model = FaceSwapper()
+	model.load_state_dict(sd)
+	return TorchINSwapper(model)
+
+
 def load_face_swapper(settings: ProcessSettings):
-	model_path = '../inswapper_128.onnx'
-	model_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), model_path)
+	if settings.swap_settings.model_type == "torch":
+		return load_face_swapper_torch(settings)
+
+	if settings.swap_settings.model_path:
+		model_path = settings.swap_settings.model_path
+	else:
+		model_path = '../inswapper_128.onnx'
+		model_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), model_path)
+
 	providers = get_default_providers() if settings.swap_settings.use_gpu else get_cpu_providers()
-	return get_model(model_path, settings.swap_settings.local_model, providers = providers)
+	return get_model(str(model_path), settings.swap_settings.model_type == "onnx_local", providers = providers)
 
 
 def get_face_swapper(settings: ProcessSettings):
@@ -116,7 +147,8 @@ class SwState():
 class SwapSettings():
 	face_path: Path
 	multi_face: bool
-	local_model: bool
+	model_type: str
+	model_path: Path | str | None
 	use_gpu: bool
 	procs_cpu: int
 	procs_gpu: int
@@ -285,10 +317,11 @@ def parallel_process_gen(swap_settings: SwapSettings, frame_gen, process_disk = 
 
 def process_img(
 		face_img: Path, frame_path: Path, output_file: Path,
-		gpu: bool, multi_face: bool, local_model: bool,
+		gpu: bool, multi_face: bool,
+		model_type: str, model: str | None,
 		overwrite: bool = False,
 ):
-	swap_settings = SwapSettings(None, multi_face, local_model, gpu, 1, 1)
+	swap_settings = SwapSettings(None, multi_face, model_type, model, gpu, 1, 1)
 	settings = ProcessSettings(False, swap_settings, False)
 	frame = cv2.imread(str(frame_path))
 

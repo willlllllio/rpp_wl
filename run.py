@@ -159,7 +159,10 @@ def start(args):
 
 	if source_path.is_file():
 		if is_img(source_path):
-			process_img(face_path, source_path, output_path, args["gpu"], args["multi_face"], args["local"], overwrite = args["overwrite"])
+			process_img(
+				face_path, source_path, output_path, args["gpu"], args["multi_face"],
+				args["model_type"], args["model"], overwrite = args["overwrite"],
+			)
 			status("swap successful!")
 			return
 		vid_info = get_video_info(source_path, ffprobe = args["ffprobe"])
@@ -499,12 +502,21 @@ def make_parser():
 	def patch_parser(parser):
 		parser.add_argument = functools.partial(add_arg, parser.add_argument)
 
+	def existing_path(p: str):
+		path = Path(p)
+		if not path.exists():
+			raise argparse.ArgumentTypeError(f"path not found: {p!r}")
+		return path
+
 	parser = argparse.ArgumentParser()
 	patch_parser(parser)
 	parser.add_argument("-f", "--face", type = Path, required = True, help = "use this face")
 	parser.add_argument("-s", "--source-vid", type = Path, required = True, help = "replace this face")
 	parser.add_argument("-o", "--output-vid", type = Path, help = "save output to this file")
 	parser.add_argument("-O", "--output-vid-formatted", help = "save output to this file with {} formatting")
+
+	parser.add_argument("-M", "--model", type = existing_path)
+	parser.add_argument("-T", "--model-type", choices = ["onnx", "onnx_local", "torch"], default = "onnx")
 
 	parser.add_argument("-v", "--verbose", action = "store_true")
 	parser.add_argument("-m", "--multi-face", action = "store_true")
@@ -558,12 +570,6 @@ def make_parser():
 	parser.add_argument("--name-suffix-swapped", default = DEFAULT_FRAME_SUFFIX_SWAPPED,
 						help = "suffix (including extension) of original frame names")
 
-	def existing_path(p: str):
-		path = Path(p)
-		if not path.exists():
-			raise argparse.ArgumentTypeError(f"path not found: {p!r}")
-		return path
-
 	parser.add_argument("--frames-dir", type = existing_path, help = "source frames tmp dir")
 	parser.add_argument("--frames-dir-root", type = existing_path, help = "source frames tmp root dir")
 
@@ -594,24 +600,36 @@ def make_parser():
 
 	parser.add_argument("--ffprobe", default = "ffprobe", help = "ffprobe command/path")
 	parser.add_argument("--ffmpeg", default = "ffmpeg", help = "ffprobe command/path")
+
+	def process_args(args):
+		pass
+
+	@functools.wraps(parser.parse_args)
+	def parse_args(fn, *pargs, **pkwargs):
+		oargs = fn(*pargs, **pkwargs)
+
+		args = { }
+		for name, value in vars(oargs).items():
+			args[name] = value
+
+		process_args(args)
+		return args
+
+	parser.parse_args_dict = functools.partial(parse_args, parser.parse_args)
+
 	return parser
 
 
 if __name__ == "__main__":
 	def setup():
 		parser = make_parser()
-		args = { }
-		for name, value in vars(parser.parse_args()).items():
-			args[name] = value
-
+		args = parser.parse_args_dict()
 		logging.basicConfig(level = logging.DEBUG if args["verbose"] else logging.INFO)
 		if args["verbose"]:
 			for k, v in args.items():
 				print(f"{k + '':<20} {v!r}")
 			print()
-
 		start(args)
 
 
-	limit()
 	setup()
