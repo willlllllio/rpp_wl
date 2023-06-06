@@ -44,8 +44,7 @@ class ConvLin(nn.Module):
 		x = F.pad(x, (1, 1, 1, 1), "reflect", 0)
 		x = self.conv(x)
 
-		x_mean = x.mean((2, 3), keepdim = True)
-		meaned = x - x_mean
+		meaned = x - x.mean((2, 3), keepdim = True)
 		x = meaned.pow(2)
 
 		x = x.mean((2, 3), keepdim = True)
@@ -85,67 +84,97 @@ class ConvLinBlock(torch.nn.Module):
 
 
 class FaceSwapper(DeviceMixin, torch.nn.Module):
-	def __init__(self, blocks = 6):
-		super().__init__()
-		self.in_act = LeakyReLU(negative_slope = 0.2)
-		self.out_act = LeakyReLU(negative_slope = 0.2)
+	def __init__(
+			self,
+			src_channels = 3,
+			src_size = 512,
 
-		self.conv_in_1 = Conv2d(3, 128, kernel_size = (7, 7), stride = (1, 1))
-		self.conv_in_2 = Conv2d(128, 256, kernel_size = (3, 3), stride = (1, 1), padding = (1, 1))
-		self.conv_in_3 = Conv2d(256, 512, kernel_size = (3, 3), stride = (2, 2), padding = (1, 1))
-		self.conv_in_4 = Conv2d(512, 1024, kernel_size = (3, 3), stride = (2, 2), padding = (1, 1))
+			down_convs = (
+					(128, 7, 1, 0),  # out_chan, kernel_size, stride, pad
+					(256, 3, 1, 1),
+					(512, 3, 2, 1),
+					(1024, 3, 2, 1),
+			),
+
+			mid_blocks = 6,
+			mid_layers = 2,
+			mid_in = 1024,
+			mid_out = 1024,
+
+			up_convs = (
+					(2.0, 512, 3, 1, 1),  # scale, out_chan, kernel_size, stride, pad
+					(2.0, 256, 3, 1, 1),
+					(None, 128, 3, 1, 1),
+			),
+			out_conv = (3, 7, 1, 3),  # out_channels, kernel, stride, pad
+
+			up_act = lambda: LeakyReLU(negative_slope = 0.2),
+			down_act = lambda: LeakyReLU(negative_slope = 0.2),
+
+	):
+		super().__init__()
+
+		down_in = [src_channels] + [i[0] for i in down_convs[:-1]]
+		self.down_convs = ModuleList([
+			Conv2d(down_in[i], out, kernel_size = (k, k), stride = (s, s), padding = ((p, p) if p else 0))
+			for i, (out, k, s, p) in enumerate(down_convs)
+		])
+		self.down_act = down_act()
 
 		self.blocks = ModuleList(
-			[ConvLinBlock() for _ in range(blocks)]
+			[ConvLinBlock(mid_layers, mid_in, mid_out, src_size) for _ in range(mid_blocks)]
 		)
 
-		self.conv_out_1 = Conv2d(1024, 512, kernel_size = (3, 3), stride = (1, 1), padding = (1, 1))
-		self.conv_out_2 = Conv2d(512, 256, kernel_size = (3, 3), stride = (1, 1), padding = (1, 1))
-		self.conv_out_3 = Conv2d(256, 128, kernel_size = (3, 3), stride = (1, 1), padding = (1, 1))
-		self.conv_out_4 = Conv2d(128, 3, kernel_size = (7, 7), stride = (1, 1))
+		up_in = [mid_out] + [i[1] for i in up_convs[:-1]]
+		self.up_scales = [i[0] for i in up_convs]
+		self.up_convs = ModuleList([
+			Conv2d(up_in[i], out, kernel_size = (k, k), stride = (s, s), padding = ((p, p) if p else 0))
+			for i, (_scale, out, k, s, p) in enumerate(up_convs)
+		])
+		self.up_act = up_act()
+
+		c, k, s, p = out_conv
+		self.out_pad = p
+		self.out_conv = Conv2d(up_convs[-1][1], out_conv[0], kernel_size = (k, k), stride = (s, s))
 
 	def forward(self, target, source):
 		target = F.pad(target, (3, 3, 3, 3), "reflect", 0)
-		target = self.conv_in_1(target)
-		target = self.in_act(target)
-		target = self.conv_in_2(target)
-		target = self.in_act(target)
-		target = self.conv_in_3(target)
-		target = self.in_act(target)
-		target = self.conv_in_4(target)
-		target = self.in_act(target)
+
+		for conv in self.down_convs:
+			target = conv(target)
+			target = self.up_act(target)
 
 		for block in self.blocks:
 			target = block(target, source)
 
-		target = F.interpolate(target, scale_factor = (2.0, 2.0), mode = "bilinear", align_corners = False)
-		target = self.conv_out_1(target)
-		target = self.out_act(target)
+		for down_conv, scale in zip(self.up_convs, self.up_scales):
+			if scale is not None:
+				target = F.interpolate(target, scale_factor = (scale, scale), mode = "bilinear", align_corners = False)
+			target = down_conv(target)
+			target = self.down_act(target)
 
-		target = F.interpolate(target, scale_factor = (2.0, 2.0), mode = "bilinear", align_corners = False)
-		target = self.conv_out_2(target)
-		target = self.out_act(target)
-
-		target = self.conv_out_3(target)
-		target = self.out_act(target)
-		target = F.pad(target, (3, 3, 3, 3), "reflect", 0)
-
-		target = self.conv_out_4(target)
+		if self.out_pad is not None:
+			target = F.pad(target, (self.out_pad, self.out_pad, self.out_pad, self.out_pad), "reflect", 0)
+		target = self.out_conv(target)
 		target = F.tanh(target)
 
 		return (target + 1) / 2
 
 
 def state_dict_onnx_to_torch(sd):
+	# convert default onnx 128 model keys to torch model
 	sd = { k: v for k, v in sd.items() if not k.startswith("initializers.") }
 
 	for base, nums in (
-			("conv_in_", (40, 42, 44, 46)),
-			("conv_out_", (590, 594, 596, 612)),
+			("down_convs.", (40, 42, 44, 46)),
+			("up_convs.", (590, 594, 596,)),
 	):
 		for pos, i in enumerate(nums):
 			for name in (".weight", ".bias"):
-				sd[f"{base}{pos + 1}{name}"] = sd.pop(f"Conv_{i}{name}")
+				sd[f"{base}{(pos if 'out' in base else pos)}{name}"] = sd.pop(f"Conv_{i}{name}")
+
+	for name in (".weight", ".bias"):
+		sd[f"out_conv{name}"] = sd.pop(f"Conv_612{name}")
 
 	for bpos, block in enumerate([
 		(("Conv_62", "Gemm_73",), ("Conv_107", "Gemm_118")),
