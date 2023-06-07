@@ -8,6 +8,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Callable
 
+from insightface.app import FaceAnalysis
+
 from core.mp_utils import imap_backpressure
 from core.utils import write_atomic, ensure, noop
 
@@ -107,11 +109,7 @@ def get_face_swapper(settings: ProcessSettings):
 
 
 def get_face(face_analyser, img_data):
-	face = face_analyser.get(img_data)
-	try:
-		return sorted(face, key = lambda x: x.bbox[0])[0]
-	except IndexError:
-		return None
+	return (get_faces(face_analyser, img_data) or [None])[0]
 
 
 def get_faces(face_analyser, img_data):
@@ -145,6 +143,7 @@ class SwState():
 	face: Any
 	swapper: Any
 	face_analyser: Any
+	face_analyser_mini: FaceAnalysisWrapper
 
 
 @dataclasses.dataclass
@@ -156,18 +155,51 @@ class SwapSettings():
 	use_gpu: bool
 	procs_cpu: int
 	procs_gpu: int
+	drop_recognition_model: bool = False
+
+
+def drop_recognition_model(face_analyser):
+	if "recognition" in face_analyser.models:
+		face_analyser.models.pop("recognition")
+		return True
+	return False
+
+
+class FaceAnalysisWrapper(FaceAnalysis):
+	# subclass of FaceAnalysis without landmark/gender and
+	#
+	def __init__(self, face_analysis: FaceAnalysis, recognition: bool = False):
+		models = dict(face_analysis.models)
+		keep = ("detection", "recognition") if recognition else ("detection",)
+		for name in list(models.keys()):
+			if name not in keep:
+				models.pop(name)
+
+		self.__face_analysis = face_analysis
+		self.models = models
+
+	def __getattribute__(self, item):
+		try:
+			return object.__getattribute__(self, item)
+		except AttributeError:
+			pass
+
+		return self.__face_analysis.__getattribute__(item)
 
 
 def _setup(settings: ProcessSettings, swap_settings: SwapSettings):
 	face_analyser = get_face_analyser(settings)
 	face = get_face(face_analyser, cv2.imread(str(swap_settings.face_path)))
+	if swap_settings.drop_recognition_model:
+		drop_recognition_model(face_analyser)
 
 	if settings.load_own_model:
 		swapper = load_face_swapper(settings)
 	else:
 		swapper = get_face_swapper(settings)
 
-	return SwState(settings, swap_settings, face, swapper, face_analyser)
+	face_analyser_mini = FaceAnalysisWrapper(face_analyser, False)
+	return SwState(settings, swap_settings, face, swapper, face_analyser, face_analyser_mini)
 
 
 def process_gen_frame_disk(state: SwState, src_tup):
@@ -178,7 +210,7 @@ def process_gen_frame_disk(state: SwState, src_tup):
 
 	src_frame = cv2.imread(str(src_frame_path))
 	try:
-		frame, faces_cnt = process_frame(state.swapper, state.face_analyser, state.face, src_frame, state.swap_settings.multi_face)
+		frame, faces_cnt = process_frame(state.swapper, state.face_analyser_mini, state.face, src_frame, state.swap_settings.multi_face)
 		is_ok, buffer = cv2.imencode(".png", frame)
 		if not is_ok:
 			logger.error("failed encoding image, %r, %r", src_ctx, type(frame))
@@ -204,7 +236,7 @@ def process_gen_frame(state: SwState, src_tup):
 	settings = state.settings
 	src_ctx, src_frame = src_tup
 	try:
-		res = process_frame(state.swapper, state.face_analyser, state.face, src_frame, state.swap_settings.multi_face)
+		res = process_frame(state.swapper, state.face_analyser_mini, state.face, src_frame, state.swap_settings.multi_face)
 		return src_ctx, res
 	except ProcessingError as ex:
 		error_handling = settings.error_handling
@@ -337,9 +369,11 @@ def process_img(
 
 	face_analyser = get_face_analyser(settings)
 	face = get_face(face_analyser, cv2.imread(str(face_img)))
+	drop_recognition_model(face_analyser)
 	swapper = load_face_swapper(settings)
 
-	frame, faces_count = process_frame(swapper, face_analyser, face, frame, multi_face)
+	face_analyser_mini = FaceAnalysisWrapper(face_analyser, False)
+	frame, faces_count = process_frame(swapper, face_analyser_mini, face, frame, multi_face)
 	is_ok, buffer = cv2.imencode(".png", frame)
 	if not is_ok:
 		raise ValueError("failed encoding image??")

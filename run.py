@@ -209,6 +209,13 @@ def _get_face(gen):
 		yield frame
 
 
+def _swap_settings(face_path: str | Path, args: dict):
+	return SwapSettings(
+		Path(face_path), args["multi_face"], args["model_type"], args["model"],
+		args["gpu"], args["parallel_cpu"], args["parallel_gpu"], False,
+	)
+
+
 def process_streamed(
 		args: dict, face_path: Path, source_path: Path,
 		output_path: Path, vid_info: VidInfo,
@@ -226,7 +233,7 @@ def process_streamed(
 	# _swap_gen wants each frame to be (some_identifier_or_ctx, frame) so use enumerate to just get pos
 	# and then remove again afterwards for vid_save_gen that just wants frames
 	gen = enumerate(gen)
-	settings = SwapSettings(face_path, args["multi_face"], args["model_type"], args["model"], args["gpu"], args["parallel_cpu"], args["parallel_gpu"])
+	settings = _swap_settings(face_path, args)
 	gen = parallel_process_gen(settings, gen)
 	gen = _get_face(gen)
 	vid_save_gen(args, source_path, output_path, vid_info, fps_output, gen)
@@ -435,7 +442,7 @@ def process_image_mode(
 			except ImportError:
 				fp_todo_use = fp_todo
 
-			settings = SwapSettings(face_path, args["multi_face"], args["model_type"], args["model"], args["gpu"], args["parallel_cpu"], args["parallel_gpu"])
+			settings = _swap_settings(face_path, args)
 
 			gen = enumerate(fp_todo_use)
 			gen = parallel_process_gen(settings, gen, True)
