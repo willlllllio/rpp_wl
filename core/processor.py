@@ -37,6 +37,10 @@ def get_face_analyser(settings: ProcessSettings):
 		providers = get_default_providers() if settings.swap_settings.use_gpu else get_cpu_providers()
 		FACE_ANALYSER = insightface.app.FaceAnalysis(name = 'buffalo_l', providers = providers)
 		FACE_ANALYSER.prepare(ctx_id = 0, det_size = (640, 640))
+		FACE_ANALYSER.models.pop("landmark_3d_68")
+		FACE_ANALYSER.models.pop("landmark_2d_106")
+		FACE_ANALYSER.models.pop("genderage")
+		pass
 	return FACE_ANALYSER
 
 
