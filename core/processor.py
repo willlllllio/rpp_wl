@@ -11,7 +11,7 @@ from typing import Any, Iterable, Callable
 from insightface.app import FaceAnalysis
 
 from core.mp_utils import imap_backpressure
-from core.utils import write_atomic, ensure, noop
+from core.utils import write_atomic, ensure, noop, Timer
 
 import cv2
 import onnxruntime
@@ -42,7 +42,6 @@ def get_face_analyser(settings: ProcessSettings):
 		FACE_ANALYSER.models.pop("landmark_3d_68")
 		FACE_ANALYSER.models.pop("landmark_2d_106")
 		FACE_ANALYSER.models.pop("genderage")
-		pass
 	return FACE_ANALYSER
 
 
@@ -187,7 +186,8 @@ class FaceAnalysisWrapper(FaceAnalysis):
 		return self.__face_analysis.__getattribute__(item)
 
 
-def _setup(settings: ProcessSettings, swap_settings: SwapSettings):
+def _setup(settings: ProcessSettings):
+	swap_settings = settings.swap_settings
 	face_analyser = get_face_analyser(settings)
 	face = get_face(face_analyser, cv2.imread(str(swap_settings.face_path)))
 	if swap_settings.drop_recognition_model:
@@ -294,11 +294,11 @@ def process_frame(swapper, face_analyser, source_face, frame, multi_face):
 _gen_state = None
 
 
-def _init_gen_state_global(settings: ProcessSettings, swap_settings: SwapSettings):
+def _init_gen_state_global(settings: ProcessSettings):
 	print("_init_gen_state_global", os.getpid(), os.getppid())
 	global _gen_state
 	ensure(_gen_state is None)
-	_gen_state = _setup(settings, swap_settings)
+	_gen_state = _setup(settings)
 	return _gen_state
 
 
@@ -328,7 +328,7 @@ def parallel_process_gen(swap_settings: SwapSettings, frame_gen, process_disk = 
 
 	error_handling = ProcErrorHandling.Log if process_disk else ProcErrorHandling.Copy
 	settings = ProcessSettings(True, swap_settings, False, error_handling, noop)
-	init_args = (settings, swap_settings)
+	init_args = (settings,)
 	procs = swap_settings.procs_gpu if swap_settings.use_gpu else swap_settings.procs_cpu
 
 	# TODO: add optional total_frames arg and: procs = min(procs, total_frames)
@@ -358,22 +358,14 @@ def parallel_process_gen(swap_settings: SwapSettings, frame_gen, process_disk = 
 
 
 def process_img(
-		face_img: Path, frame_path: Path, output_file: Path,
-		gpu: bool, multi_face: bool,
-		model_type: str, model: str | None,
+		swap_settings: SwapSettings, frame_path: Path, output_file: Path,
 		overwrite: bool = False,
 ):
-	swap_settings = SwapSettings(None, multi_face, model_type, model, gpu, 1, 1)
 	settings = ProcessSettings(False, swap_settings, False)
-	frame = cv2.imread(str(frame_path))
+	state = _setup(settings)
 
-	face_analyser = get_face_analyser(settings)
-	face = get_face(face_analyser, cv2.imread(str(face_img)))
-	drop_recognition_model(face_analyser)
-	swapper = load_face_swapper(settings)
-
-	face_analyser_mini = FaceAnalysisWrapper(face_analyser, False)
-	frame, faces_count = process_frame(swapper, face_analyser_mini, face, frame, multi_face)
+	src_frame = cv2.imread(str(frame_path))
+	frame, faces_count = process_frame(state.swapper, state.face_analyser_mini, state.face, src_frame, state.swap_settings.multi_face)
 	is_ok, buffer = cv2.imencode(".png", frame)
 	if not is_ok:
 		raise ValueError("failed encoding image??")

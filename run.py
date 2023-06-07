@@ -162,10 +162,7 @@ def start(args):
 
 	if source_path.is_file():
 		if source_is_image:
-			process_img(
-				face_path, source_path, output_path, args["gpu"], args["multi_face"],
-				args["model_type"], args["model"], overwrite = args["overwrite"],
-			)
+			process_img(_swap_settings(face_path, args), source_path, output_path, overwrite = args["overwrite"])
 			status("swap successful!")
 			return
 		vid_info = get_video_info(source_path, ffprobe = args["ffprobe"])
