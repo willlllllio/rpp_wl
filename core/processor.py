@@ -193,6 +193,7 @@ def process_gen_frame_disk(state: SwState, src_tup):
 			os.symlink(src_frame_path.absolute(), target_frame_path.absolute())
 		else:
 			raise NotImplementedError(error_handling, src_frame_path, target_frame_path)  # TODO
+			pass
 
 
 def process_gen_frame(state: SwState, src_tup):
@@ -288,9 +289,14 @@ def _passthrough(i):
 def parallel_process_gen(swap_settings: SwapSettings, frame_gen, process_disk = False):
 	print(f"main proc {os.getpid()}")
 	print(f"procs_cpu={swap_settings.procs_cpu} use_gpu={swap_settings.use_gpu} procs_gpu={swap_settings.procs_gpu} ")
-	settings = ProcessSettings(True, swap_settings, False, ProcErrorHandling.Copy, noop)
+
+	error_handling = ProcErrorHandling.Log if process_disk else ProcErrorHandling.Copy
+	settings = ProcessSettings(True, swap_settings, False, error_handling, noop)
 	init_args = (settings, swap_settings)
 	procs = swap_settings.procs_gpu if swap_settings.use_gpu else swap_settings.procs_cpu
+
+	# TODO: add optional total_frames arg and: procs = min(procs, total_frames)
+	# to not init tons of unneeded model
 
 	process_fn = process_gen_frame_disk if process_disk else process_gen_frame
 	if procs > 1:

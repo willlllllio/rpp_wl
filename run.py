@@ -65,7 +65,7 @@ def status(string):
 _leading_num_reg = re.compile("^(\d+)(?:[^\d]|$)")
 
 
-def get_framepaths(frames_dir: Path, filename_suffix: str, ensure_continuous: bool = True) -> list[Path]:
+def get_framepaths(frames_dir: Path, filename_suffix: str | Iterable[str], ensure_continuous: bool = True) -> list[Path]:
 	with os.scandir(frames_dir) as it:
 		files = [i for i in it if i.is_file() and i.name.endswith(filename_suffix)]
 
@@ -77,7 +77,7 @@ def get_framepaths(frames_dir: Path, filename_suffix: str, ensure_continuous: bo
 	return [Path(i.path) for _, i in with_num]
 
 
-def get_imagepaths(frames_dir: Path, filename_suffix: str) -> list[Path]:
+def get_imagepaths(frames_dir: Path, filename_suffix: str | Iterable[str]) -> list[Path]:
 	with os.scandir(frames_dir) as it:
 		files = [i for i in it if i.is_file() and i.name.endswith(filename_suffix)]
 
@@ -144,7 +144,7 @@ def start(args):
 	source_is_image = source_path.is_file() and is_img(source_path)
 
 	output_path = args["output_vid"]
-	if not image_mode:
+	if not image_mode or source_is_image:
 		_default_format = args["img_format"] if source_is_image else args["format"]
 		if output_path:
 			if output_path.is_dir():
@@ -155,10 +155,13 @@ def start(args):
 		if not args["overwrite"]:
 			ensure(not output_path.exists(), c = ("output_path exists", output_path))
 
-	print(f"saving to {str(output_path)!r}")
+	if output_path:
+		print(f"saving to {str(output_path)!r}")
+	else:
+		print(f"no output path")
 
 	if source_path.is_file():
-		if is_img(source_path):
+		if source_is_image:
 			process_img(
 				face_path, source_path, output_path, args["gpu"], args["multi_face"],
 				args["model_type"], args["model"], overwrite = args["overwrite"],
@@ -168,7 +171,7 @@ def start(args):
 		vid_info = get_video_info(source_path, ffprobe = args["ffprobe"])
 	else:
 		vid_info = VidInfo(0, 0, args["fps_source"], False)
-		if not (image_mode and not output_path):
+		if not (image_mode and (not output_path or args["no_output"])):
 			ensure(vid_info.fps, c = ("source_path is png sequence, manually passing --fps_source framerate argument required"))
 
 	with Timer("setgrad took {:.2f} secs"):
@@ -223,7 +226,7 @@ def process_streamed(
 	# _swap_gen wants each frame to be (some_identifier_or_ctx, frame) so use enumerate to just get pos
 	# and then remove again afterwards for vid_save_gen that just wants frames
 	gen = enumerate(gen)
-	settings = SwapSettings(face_path, args["multi_face"], args["local"], args["gpu"], args["parallel_cpu"], args["parallel_gpu"])
+	settings = SwapSettings(face_path, args["multi_face"], args["model_type"], args["model"], args["gpu"], args["parallel_cpu"], args["parallel_gpu"])
 	gen = parallel_process_gen(settings, gen)
 	gen = _get_face(gen)
 	vid_save_gen(args, source_path, output_path, vid_info, fps_output, gen)
@@ -381,12 +384,14 @@ def process_image_mode(
 		ensure(source_path.is_dir())
 		in_frames_dir = source_path
 
-	if output_path:
+	if output_path and not args["no_output"]:
 		in_frame_paths = get_framepaths(in_frames_dir, name_suffix_org, ensure_continuous = True)
 	else:
-		in_frame_paths = get_imagepaths(in_frames_dir, name_suffix_org)
+		extensions = (".png", ".jpg", ".jpeg", *([name_suffix_org] if name_suffix_org else []))
+		in_frame_paths = get_imagepaths(in_frames_dir, extensions)
 
 	status(f"got {len(in_frame_paths)} input frames/images total.")
+	print(f"{in_frame_paths=}")
 
 	with Timer("swap took {:.2f} secs"):
 		if args["swapped_dir"]:
@@ -400,7 +405,8 @@ def process_image_mode(
 					"one of work_dir or work_dir_root or swapped_dir or swapped_dir_root required to write swapped frames to"
 				))
 			swapped_frames_dir = _root / f"f_swapped__{source_path.name}__F{fps_use or 'srcfps'}"
-			makedir(swapped_frames_dir, exist_ok = True, parents = 2)
+			parents = 2 if args["swapped_dir_root"] else 3
+			makedir(swapped_frames_dir, exist_ok = True, parents = parents)
 
 		fp_all, fp_todo, fp_done = _frames(in_frame_paths, swapped_frames_dir, name_suffix_org, name_suffix_swapped)
 		ensure(fp_all, c = ("didn't find any frames", in_frame_paths))
@@ -429,7 +435,8 @@ def process_image_mode(
 			except ImportError:
 				fp_todo_use = fp_todo
 
-			settings = SwapSettings(face_path, args["multi_face"], args["local"], args["gpu"], args["parallel_cpu"], args["parallel_gpu"])
+			settings = SwapSettings(face_path, args["multi_face"], args["model_type"], args["model"], args["gpu"], args["parallel_cpu"], args["parallel_gpu"])
+
 			gen = enumerate(fp_todo_use)
 			gen = parallel_process_gen(settings, gen, True)
 			for i in gen:
@@ -437,10 +444,11 @@ def process_image_mode(
 		else:
 			status("skipping swapping, all finished already")
 
-	if not output_path:
-		status("swap successful!")
+	if not output_path or args["no_output"]:
+		status("swap successful, done!")
 		return
 
+	status("swap successful, creating video!")
 	vid_save_frames(args, swapped_frames_dir, source_path, output_path, vid_info, fps_swapped)
 
 
@@ -526,6 +534,9 @@ def make_parser():
 
 	parser.add_argument("--image-mode", action = "store_true",
 						help = "work with directories of images")
+
+	parser.add_argument("-V", "--no-output", action = "store_true",
+						help = "don't create video in image mode (even when output path given)")
 
 	parser.add_argument("--no-tmp", action = "store_true",
 						help = "work with directories of images")
