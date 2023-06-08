@@ -1,3 +1,28 @@
+# from https://github.com/deepinsight/insightface/blob/bc19ea168beb303c757fb3fd797582ee07708e2f/python-package/insightface/model_zoo/inswapper.py#L12
+#
+# MIT License
+#
+# Copyright (c) 2022 Jiankang Deng and Jia Guo
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+
 import os
 
 import torch
@@ -18,7 +43,6 @@ class TorchINSwapper():
 		self.input_mean = 0.0
 		self.input_std = 255.0
 		self.input_size = (128, 128)
-
 
 	def get(self, img, target, source_face, paste_back = True):
 		# print("patched get!!!~!")
