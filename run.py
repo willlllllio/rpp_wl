@@ -209,7 +209,8 @@ def _get_face(gen):
 def _swap_settings(face_path: str | Path, args: dict):
 	return SwapSettings(
 		Path(face_path), args["multi_face"], args["model_type"], args["model"],
-		args["gpu"], args["parallel_cpu"], args["parallel_gpu"], args["device"], False,
+		args["gpu"], args["parallel_cpu"], args["parallel_gpu"], args["device"],
+		not args["no_own_model"], False,
 	)
 
 
@@ -581,6 +582,7 @@ def make_parser():
 
 	parser.add_argument("--tqdm", action = "store_true")
 	parser.add_argument("-D", "--device")
+	parser.add_argument("--no-own-model", action = "store_true")
 
 	formatarg = lambda inp: inp.lstrip(".").strip()
 	parser.add_argument("-F", "--format", default = "mp4", type = formatarg, help = "video container to use, default: mp4")

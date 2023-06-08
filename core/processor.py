@@ -39,46 +39,49 @@ def get_cpu_providers():
 	return ['CPUExecutionProvider']
 
 
+def load_face_analyser(settings: ProcessSettings):
+	providers = get_default_providers() if settings.swap_settings.use_gpu else get_cpu_providers()
+	fa = insightface.app.FaceAnalysis(name = 'buffalo_l', providers = providers)
+	fa.prepare(ctx_id = 0, det_size = (640, 640))
+	fa.models.pop("landmark_3d_68")
+	fa.models.pop("landmark_2d_106")
+	fa.models.pop("genderage")
+
+	if settings.swap_settings.model_type == "torch":
+		try:
+			model_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "../buffalo_l_detect.ckpt")
+			detect = torch.load(model_path)
+			print("loaded from file")
+		except:
+			from onnx2torch import convert
+			onnx_model_path = os.path.expanduser("~/.insightface/models/buffalo_l/det_10g.onnx")
+			# You can pass the path to the onnx model to convert it or...
+			with Timer("converting detectmodel took {} secs"):
+				detect = convert(onnx_model_path)
+
+		def my_run(*args, **kwargs):
+			with torch.no_grad():
+				# print('torch detect!')
+				device = settings.torch_device or model_device(detect)
+				blob = args[1]["input.1"]
+				blob = torch.from_numpy(blob).to(device)
+				res = detect(blob)
+				return [i.detach().cpu().numpy() for i in res]
+
+		if settings.torch_device is not None:
+			detect.to(settings.torch_device)
+
+		org_model = fa.models["detection"]
+		org_model.session.run = my_run
+		print("using torch RetinaFace")
+
+	return fa
+
+
 def get_face_analyser(settings: ProcessSettings):
 	global FACE_ANALYSER
 	if FACE_ANALYSER is None:
-		providers = get_default_providers() if settings.swap_settings.use_gpu else get_cpu_providers()
-		fa = insightface.app.FaceAnalysis(name = 'buffalo_l', providers = providers)
-		fa.prepare(ctx_id = 0, det_size = (640, 640))
-		fa.models.pop("landmark_3d_68")
-		fa.models.pop("landmark_2d_106")
-		fa.models.pop("genderage")
-
-		if settings.swap_settings.model_type == "torch":
-			try:
-				model_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "../buffalo_l_detect.ckpt")
-				detect = torch.load(model_path)
-				print("loaded from file")
-			except:
-				from onnx2torch import convert
-				onnx_model_path = os.path.expanduser("~/.insightface/models/buffalo_l/det_10g.onnx")
-				# You can pass the path to the onnx model to convert it or...
-				with Timer("converting detectmodel took {} secs"):
-					detect = convert(onnx_model_path)
-
-			def my_run(*args, **kwargs):
-				with torch.no_grad():
-					# print('torch detect!')
-					device = settings.torch_device or model_device(detect)
-					blob = args[1]["input.1"]
-					blob = torch.from_numpy(blob).to(device)
-					res = detect(blob)
-					return [i.detach().cpu().numpy() for i in res]
-
-			if settings.torch_device is not None:
-				detect.to(settings.torch_device)
-
-			org_model = fa.models["detection"]
-			org_model.session.run = my_run
-			print("using torch RetinaFace")
-
-		FACE_ANALYSER = fa
-
+		FACE_ANALYSER = load_face_analyser(settings)
 	return FACE_ANALYSER
 
 
@@ -196,6 +199,7 @@ class SwapSettings():
 	procs_cpu: int
 	procs_gpu: int
 	torch_device: str | bool = False
+	load_own_model: bool = True
 	drop_recognition_model: bool = False
 
 
@@ -230,7 +234,12 @@ class FaceAnalysisWrapper(FaceAnalysis):
 
 def _setup(settings: ProcessSettings):
 	swap_settings = settings.swap_settings
-	face_analyser = get_face_analyser(settings)
+
+	if settings.load_own_model:
+		face_analyser = load_face_analyser(settings)
+	else:
+		face_analyser = get_face_analyser(settings)
+
 	face = get_face(face_analyser, cv2.imread(str(swap_settings.face_path)))
 	if swap_settings.drop_recognition_model:
 		drop_recognition_model(face_analyser)
@@ -369,7 +378,7 @@ def parallel_process_gen(swap_settings: SwapSettings, frame_gen, process_disk = 
 	print(f"procs_cpu={swap_settings.procs_cpu} use_gpu={swap_settings.use_gpu} procs_gpu={swap_settings.procs_gpu} ")
 
 	error_handling = ProcErrorHandling.Log if process_disk else ProcErrorHandling.Copy
-	settings = ProcessSettings(True, swap_settings, False, error_handling, noop)
+	settings = ProcessSettings(swap_settings.load_own_model, swap_settings, False, error_handling, noop)
 	if swap_settings.model_type == "torch" and swap_settings.use_gpu:
 		tdev = settings.swap_settings.torch_device
 		devname = None
