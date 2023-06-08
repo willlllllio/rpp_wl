@@ -147,10 +147,10 @@ class FaceSwapper(DeviceMixin, torch.nn.Module):
 		for block in self.blocks:
 			target = block(target, source)
 
-		for down_conv, scale in zip(self.up_convs, self.up_scales):
+		for conv, scale in zip(self.up_convs, self.up_scales):
 			if scale is not None:
 				target = F.interpolate(target, scale_factor = (scale, scale), mode = "bilinear", align_corners = False)
-			target = down_conv(target)
+			target = conv(target)
 			target = self.down_act(target)
 
 		if self.out_pad is not None:
