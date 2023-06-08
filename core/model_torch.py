@@ -35,10 +35,10 @@ class ConvLin(nn.Module):
 		super().__init__()
 
 		# assert src_out // 2 == xout
-		src_out = xout * 2
 		self.conv = nn.Conv2d(xin, xout, kernel_size = (3, 3), stride = (1, 1))
-		self.lin = nn.Linear(in_features = src_in, out_features = src_out, bias = True)
+		self.lin = nn.Linear(in_features = src_in, out_features = (xout * 2), bias = True)
 		self.act = act
+		self.xout = xout
 
 	def forward(self, x, source):
 		x = F.pad(x, (1, 1, 1, 1), "reflect", 0)
@@ -53,8 +53,8 @@ class ConvLin(nn.Module):
 
 		source = self.lin(source)
 		source = source.unsqueeze(dim = 2).unsqueeze(dim = 2)
-		src1 = source[:, :1024, :, :]
-		src2 = source[:, 1024:, :, :]
+		src1 = source[:, :self.xout, :, :]
+		src2 = source[:, self.xout:, :, :]
 
 		x = src1 * x + src2
 		if self.act:
@@ -137,7 +137,9 @@ class FaceSwapper(DeviceMixin, torch.nn.Module):
 		self.out_pad = p
 		self.out_conv = Conv2d(up_convs[-1][1], out_conv[0], kernel_size = (k, k), stride = (s, s))
 
-	def forward(self, target, source):
+		self.register_buffer('l_init', torch.zeros((src_size, src_size)))
+
+	def forward(self, target, source, return_hidden = False):
 		target = F.pad(target, (3, 3, 3, 3), "reflect", 0)
 
 		for conv in self.down_convs:
@@ -146,6 +148,9 @@ class FaceSwapper(DeviceMixin, torch.nn.Module):
 
 		for block in self.blocks:
 			target = block(target, source)
+
+		if return_hidden:
+			return target
 
 		for conv, scale in zip(self.up_convs, self.up_scales):
 			if scale is not None:
@@ -161,7 +166,7 @@ class FaceSwapper(DeviceMixin, torch.nn.Module):
 		return (target + 1) / 2
 
 
-def state_dict_onnx_to_torch(sd):
+def state_dict_onnx_to_torch(sd, l_init = None):
 	# convert default onnx 128 model keys to torch model
 	sd = { k: v for k, v in sd.items() if not k.startswith("initializers.") }
 
@@ -188,5 +193,8 @@ def state_dict_onnx_to_torch(sd):
 			for name, newname in zip(l, ("conv", "lin")):
 				for fix in (".weight", ".bias"):
 					sd[f"blocks.{bpos}.layers.{layerpos}.{newname}{fix}"] = sd.pop(f"{name}{fix}")
+
+	if l_init is not None:
+		sd["l_init"] = l_init
 
 	return sd

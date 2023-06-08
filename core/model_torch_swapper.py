@@ -33,12 +33,8 @@ from insightface.utils import face_align
 
 class TorchINSwapper():
 	def __init__(self, model):
-		print("TorchINSwapper", TorchINSwapper)
 		self.model = model
 		self.model.eval()
-
-		emap = os.path.join(os.path.abspath(os.path.dirname(__file__)), "emap.npy")
-		self.emap = np.load(emap, allow_pickle = False)
 
 		self.input_mean = 0.0
 		self.input_std = 255.0
@@ -51,7 +47,7 @@ class TorchINSwapper():
 									 (self.input_mean, self.input_mean, self.input_mean), swapRB = True)
 
 		latent = source_face.normed_embedding.reshape((1, -1))
-		latent = np.dot(latent, self.emap)
+		latent = np.dot(latent, self.model.l_init)
 		latent /= np.linalg.norm(latent)
 
 		import contextlib
