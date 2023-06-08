@@ -195,6 +195,7 @@ class SwapSettings():
 	use_gpu: bool
 	procs_cpu: int
 	procs_gpu: int
+	torch_device: str | bool = False
 	drop_recognition_model: bool = False
 
 
@@ -370,9 +371,19 @@ def parallel_process_gen(swap_settings: SwapSettings, frame_gen, process_disk = 
 	error_handling = ProcErrorHandling.Log if process_disk else ProcErrorHandling.Copy
 	settings = ProcessSettings(True, swap_settings, False, error_handling, noop)
 	if swap_settings.model_type == "torch" and swap_settings.use_gpu:
-		if torch.cuda.is_available():
-			settings.torch_device = torch.device("cuda")
-			print("using torch device: ", settings.torch_device)
+		tdev = settings.swap_settings.torch_device
+		devname = None
+		if isinstance(tdev, str):
+			devname = tdev
+		elif tdev is not False:
+			if torch.has_cuda and torch.cuda.is_available():
+				devname = "cuda"
+			elif torch.has_mps and torch.backends.mps.is_available():
+				devname = "mps"
+
+		if devname:
+			settings.torch_device = torch.device(devname)
+			print("using torch device: ", repr(settings.torch_device))
 
 	init_args = (settings,)
 	procs = swap_settings.procs_gpu if swap_settings.use_gpu else swap_settings.procs_cpu

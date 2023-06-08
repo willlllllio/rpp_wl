@@ -209,7 +209,7 @@ def _get_face(gen):
 def _swap_settings(face_path: str | Path, args: dict):
 	return SwapSettings(
 		Path(face_path), args["multi_face"], args["model_type"], args["model"],
-		args["gpu"], args["parallel_cpu"], args["parallel_gpu"], False,
+		args["gpu"], args["parallel_cpu"], args["parallel_gpu"], args["device"], False,
 	)
 
 
@@ -233,6 +233,10 @@ def process_streamed(
 	settings = _swap_settings(face_path, args)
 	gen = parallel_process_gen(settings, gen)
 	gen = _get_face(gen)
+
+	if args["tqdm"]:
+		import tqdm
+		gen = tqdm.tqdm(gen)
 	vid_save_gen(args, source_path, output_path, vid_info, fps_output, gen)
 
 
@@ -574,6 +578,9 @@ def make_parser():
 						help = "format: position_idx argument. arguments passed to ffmpeg reader. Note: add space in front if it starts with -")
 	parser.add_argument("-W", "--ffmpeg-writer-args", nargs = 2, action = "append",
 						help = "arguments passed to ffmpeg reader after input. Note: add space in front if it starts with -")
+
+	parser.add_argument("--tqdm", action = "store_true")
+	parser.add_argument("-D", "--device")
 
 	formatarg = lambda inp: inp.lstrip(".").strip()
 	parser.add_argument("-F", "--format", default = "mp4", type = formatarg, help = "video container to use, default: mp4")
