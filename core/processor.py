@@ -8,6 +8,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Callable
 
+import torch
 from insightface.app import FaceAnalysis
 
 from core.mp_utils import imap_backpressure
@@ -25,6 +26,11 @@ FACE_SWAPPER = None
 FACE_ANALYSER = None
 
 
+def model_device(model: torch.nn.Module):
+	# TODO: check _buffers if no params?
+	return next(model.parameters()).device
+
+
 def get_default_providers():
 	return onnxruntime.get_available_providers()
 
@@ -37,11 +43,42 @@ def get_face_analyser(settings: ProcessSettings):
 	global FACE_ANALYSER
 	if FACE_ANALYSER is None:
 		providers = get_default_providers() if settings.swap_settings.use_gpu else get_cpu_providers()
-		FACE_ANALYSER = insightface.app.FaceAnalysis(name = 'buffalo_l', providers = providers)
-		FACE_ANALYSER.prepare(ctx_id = 0, det_size = (640, 640))
-		FACE_ANALYSER.models.pop("landmark_3d_68")
-		FACE_ANALYSER.models.pop("landmark_2d_106")
-		FACE_ANALYSER.models.pop("genderage")
+		fa = insightface.app.FaceAnalysis(name = 'buffalo_l', providers = providers)
+		fa.prepare(ctx_id = 0, det_size = (640, 640))
+		fa.models.pop("landmark_3d_68")
+		fa.models.pop("landmark_2d_106")
+		fa.models.pop("genderage")
+
+		if settings.swap_settings.model_type == "torch":
+			try:
+				model_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "../buffalo_l_detect.ckpt")
+				detect = torch.load(model_path)
+				print("loaded from file")
+			except:
+				from onnx2torch import convert
+				onnx_model_path = os.path.expanduser("~/.insightface/models/buffalo_l/det_10g.onnx")
+				# You can pass the path to the onnx model to convert it or...
+				with Timer("converting detectmodel took {} secs"):
+					detect = convert(onnx_model_path)
+
+			def my_run(*args, **kwargs):
+				with torch.no_grad():
+					# print('torch detect!')
+					device = settings.torch_device or model_device(detect)
+					blob = args[1]["input.1"]
+					blob = torch.from_numpy(blob).to(device)
+					res = detect(blob)
+					return [i.detach().cpu().numpy() for i in res]
+
+			if settings.torch_device is not None:
+				detect.to(settings.torch_device)
+
+			org_model = fa.models["detection"]
+			org_model.session.run = my_run
+			print("using torch RetinaFace")
+
+		FACE_ANALYSER = fa
+
 	return FACE_ANALYSER
 
 
@@ -83,6 +120,9 @@ def load_face_swapper_torch(settings: ProcessSettings):
 
 	model = FaceSwapper()
 	model.load_state_dict(sd)
+	if settings.torch_device is not None:
+		model.to(settings.torch_device)
+
 	return TorchINSwapper(model)
 
 
@@ -130,6 +170,7 @@ class ProcessSettings():
 	skip_existing: bool = False
 	error_handling: ProcErrorHandling = ProcErrorHandling.Log
 	progprint: Any = builtins.print
+	torch_device: torch.device | None = None
 
 	def progress(self, status):
 		self.progprint(status, end = "", flush = True)
@@ -328,6 +369,11 @@ def parallel_process_gen(swap_settings: SwapSettings, frame_gen, process_disk = 
 
 	error_handling = ProcErrorHandling.Log if process_disk else ProcErrorHandling.Copy
 	settings = ProcessSettings(True, swap_settings, False, error_handling, noop)
+	if swap_settings.model_type == "torch" and swap_settings.use_gpu:
+		if torch.cuda.is_available():
+			settings.torch_device = torch.device("cuda")
+			print("using torch device: ", settings.torch_device)
+
 	init_args = (settings,)
 	procs = swap_settings.procs_gpu if swap_settings.use_gpu else swap_settings.procs_cpu
 
