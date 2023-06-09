@@ -25,7 +25,7 @@ import cv2
 import numpy as np
 
 from core.processor import process_img, parallel_process_gen, SwapSettings
-from core.utils import is_img, add_audio, extract_frames, ensure, Timer, create_video_with_audio, ensure_equal, create_video_from_frame_gen, \
+from core.utils import is_img, add_audio, extract_frames, ensure, Timer, create_video_from_sequence, ensure_equal, create_video_from_frame_gen, \
 	tmp_path_move_ctx, str_to_num, get_video_info, VidInfo
 import psutil
 
@@ -115,6 +115,15 @@ def output_args_replace(format_str: str, face_path: Path, source_path: Path, arg
 			return source_path.with_suffix("").name
 		if name == "face_bnc":
 			return face_path.with_suffix("").name
+		if name in ("cut", "C"):
+			start = (args["start"] or "").replace(":", ";")
+			start = "S" + start if start else ""
+			length = (args["length"] or "").replace(":", ";")
+			length = "L" + length if length else ""
+			if not (start or length):
+				return ""
+
+			return f"{start}{length}"
 		if name in ("format", "F", "ext"):
 			return args["format"]
 		if name == "plain_format":
@@ -223,7 +232,12 @@ def process_streamed(
 	# Note: cv2 VideoCapture is much faster (almost 2x) but has no way to easily skip frames,
 	# would have to get frame timestamps and implement skipping by hand when using fps_use to always use, or assume constant fps.
 
-	if args["cv2_reader"] or (args["ffmpeg_reader"] is False and src_fps_output_max is None):
+	requires_ffmpeg_reader = (
+			src_fps_output_max is not None
+			or args["start"] is not None
+			or args["length"] is not None
+	)
+	if args["cv2_reader"] or (args["ffmpeg_reader"] is False and requires_ffmpeg_reader is False):
 		gen = _frame_gen_cv2(source_path)
 	else:
 		gen = _frame_gen_ffmpeg(args, source_path, vid_info.width, vid_info.height, src_fps_output_max)
@@ -244,14 +258,18 @@ def process_streamed(
 def vid_save_gen(args, source_path: Path, output_path: Path, vid_info: VidInfo, fps_output: int | float, frame_gen):
 	output_path_write, audio_source_path, audio_2stage, overwrite = _video_save(args, source_path, output_path, vid_info)
 
-	_tmp_file_ctx = functools.partial(tmp_path_move_ctx, trail_org_ext = True, overwrite = overwrite, overwrite_delete_tmp = overwrite)
+	_tmp_file_ctx = functools.partial(tmp_path_move_ctx, trail_org_ext = True, overwrite = overwrite, overwrite_delete_tmp = True)
 	_tmp_file_ctx = no_tmp_ctx if args["no_tmp"] else _tmp_file_ctx
+
+	# if length is given the video will already be cut to that length so just use -shortest so audio cuts off together
+	audio_shortest = args["audio_shortest"] or args["length"]
 	with _tmp_file_ctx(output_path_write) as tmp_path:
 		pos_args = _parse_ffmpeg_args(args["ffmpeg_writer_args"] or [], fill = True)
 		ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info"], pos_args = pos_args)
 		create_video_from_frame_gen(
 			frame_gen, vid_info.width, vid_info.height, fps_output, tmp_path,
-			preset = args["preset"], crf = args["crf"], audio_source_path = audio_source_path, audio_shortest = args["audio_shortest"],
+			preset = args["preset"], crf = args["crf"],
+			audio_source_path = audio_source_path, audio_start = args["start"], audio_shortest = audio_shortest,
 			**ffmpeg,
 		)
 
@@ -259,7 +277,7 @@ def vid_save_gen(args, source_path: Path, output_path: Path, vid_info: VidInfo, 
 		ensure(output_path != output_path_write)
 		with _tmp_file_ctx(output_path) as tmp_path:
 			ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info"])
-			add_audio(output_path_write, source_path, tmp_path, shortest = args["audio_shortest"], **ffmpeg)
+			add_audio(output_path_write, source_path, tmp_path, audio_start = args["start"], shortest = audio_shortest, **ffmpeg)
 
 
 def _video_save(args, source_path: Path, output_path: Path, vid_info: VidInfo):
@@ -304,15 +322,24 @@ def _frame_gen_ffmpeg(args, source_path: Path, width, height, fps_to_output: int
 	ffmpeg = [args["ffmpeg"], "-hide_banner", "-loglevel", "info"]
 	fps = ["-filter:v", f"fps=fps={fps_to_output}"] if fps_to_output else []
 
+	start = []
+	if args["start"]:
+		start = ["-ss", args["start"]]
+	length = []
+	if args["length"]:
+		length = ["-t", args["length"]]
+
 	pos_args = _parse_ffmpeg_args(args["ffmpeg_reader_args"] or [], fill = True)
 	com = [
 		*ffmpeg,
 		*pos_args[0],
+		*start,
 		"-i", str(source_path),
 		*pos_args[1],
 		*fps,
 		"-pix_fmt", "bgr24", "-f", "rawvideo",
 		*pos_args[2],
+		*length,
 		"pipe:",
 		*pos_args[3],
 	]
@@ -387,7 +414,11 @@ def process_image_mode(
 			else:
 				makedir(in_frames_dir, exist_ok = True, parents = 2)
 				status(f"extracting frames to {str(in_frames_dir)!r}")
-				extract_frames(source_path, in_frames_dir, fps_use, filename_pattern = name_pattern(name_suffix_org), **ffmpeg)
+				extract_frames(
+					source_path, in_frames_dir, fps_use,
+					start = args["start"], length = args["length"],
+					filename_pattern = name_pattern(name_suffix_org), **ffmpeg,
+				)
 	else:
 		print("using png sequence as source")
 		ensure(source_path.is_dir())
@@ -465,14 +496,17 @@ def vid_save_frames(args, swapped_frames_dir: Path, source_path: Path, output_pa
 	output_path_write, audio_source_path, audio_2stage, overwrite = _video_save(args, source_path, output_path, vid_info)
 
 	swapped_pat = name_pattern(args["name_suffix_swapped"])
-	_tmp_file_ctx = functools.partial(tmp_path_move_ctx, trail_org_ext = True, overwrite = overwrite, overwrite_delete_tmp = overwrite)
+	_tmp_file_ctx = functools.partial(tmp_path_move_ctx, trail_org_ext = True, overwrite = overwrite, overwrite_delete_tmp = True)
 	_tmp_file_ctx = no_tmp_ctx if args["no_tmp"] else _tmp_file_ctx
+
+	# if length is given the video will already be cut to that length so just use -shortest so audio cuts off together
+	audio_shortest = args["audio_shortest"] or args["length"]
 	with _tmp_file_ctx(output_path_write) as tmp_path:
 		pos_args = _parse_ffmpeg_args(args["ffmpeg_writer_args"] or [], fill = True)
 		ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info", ], pos_args = pos_args)
-		create_video_with_audio(
+		create_video_from_sequence(
 			swapped_frames_dir, fps_output, tmp_path,
-			audio_source_path = audio_source_path, audio_shortest = args["audio_shortest"],
+			audio_source_path = audio_source_path, audio_start = args["start"], audio_shortest = audio_shortest,
 			filename_pattern = swapped_pat,
 			preset = args["preset"], crf = args["crf"],
 			**ffmpeg,
@@ -482,7 +516,7 @@ def vid_save_frames(args, swapped_frames_dir: Path, source_path: Path, output_pa
 		ensure(output_path != output_path_write)
 		with _tmp_file_ctx(output_path) as tmp_path:
 			ffmpeg = dict(ffmpeg = args["ffmpeg"], extra_args = ["-hide_banner", "-loglevel", "info"])
-			add_audio(output_path_write, source_path, tmp_path, shortest = args["audio_shortest"], **ffmpeg)
+			add_audio(output_path_write, source_path, tmp_path, audio_start = args["start"], shortest = audio_shortest, **ffmpeg)
 
 
 def make_parser():
@@ -534,6 +568,9 @@ def make_parser():
 
 	parser.add_argument("-M", "--model", type = existing_path)
 	parser.add_argument("-T", "--model-type", choices = ["onnx", "onnx_local", "torch"], default = "onnx")
+
+	parser.add_argument("-S", "--start", help = "start offset for input video, ffmpeg format")
+	parser.add_argument("-L", "--length", help = "max length of input vidoe to use, ffmpeg format")
 
 	parser.add_argument("-v", "--verbose", action = "store_true")
 	parser.add_argument("-m", "--multi-face", action = "store_true")
@@ -610,10 +647,10 @@ def make_parser():
 	parser.add_argument("-d", "--direct-audio", action = "store_true",
 						help = "add audio directly to output file in one go (instead of plain file and then 2nd separate file with audio merged in)")
 
-	parser.add_argument("-S", "--redo-swapped", action = "store_true",
+	parser.add_argument("--redo-swapped", action = "store_true",
 						help = "always redo any already swapped images")
 
-	parser.add_argument("-C", "--redo-completed-swap", action = "store_true",
+	parser.add_argument("--redo-completed-swap", action = "store_true",
 						help = "redo swapping if it has been fully completed")
 
 	parser.add_argument("--max-memory", default = 16, type = int, help = "set max memory")

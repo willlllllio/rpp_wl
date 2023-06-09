@@ -99,10 +99,26 @@ def write_atomic(data: bytes, target: str | Path,
 	os.rename(tmp_file, target)
 
 
-def extract_frames(input_path, output_dir: Path, target_fps: Optional[int] = None,
-				   filename_pattern = "%05d.png", ffmpeg = "ffmpeg", extra_args = None):
+def extract_frames(
+		input_path, output_dir: Path, target_fps: Optional[int] = None,
+		start = None, length = None,
+		filename_pattern = "%05d.png", ffmpeg = "ffmpeg", extra_args = None,
+):
 	fps = ["-filter:v", f"fps=fps={target_fps}"] if target_fps else []
-	subprocess.check_call([ffmpeg, "-n", *(extra_args or []), "-i", str(input_path), *fps, str(output_dir / filename_pattern)])
+
+	start = ["-ss", start] if start else []
+	length = ["-t", length] if length else []
+
+	com = [
+		ffmpeg, "-n",
+		*(extra_args or []),
+		*start,
+		"-i", str(input_path),
+		*fps,
+		*length,
+		str(output_dir / filename_pattern)
+	]
+	subprocess.check_call(com)
 
 
 def create_video_from_frame_gen(
@@ -110,16 +126,21 @@ def create_video_from_frame_gen(
 		audio_source_path: Path | str | None = None, audio_shortest: bool = False,
 		crf: int | None = None, preset: str | None = None,
 		finish_timeout = 60, check = True,
+		audio_start = None,
 		ffmpeg = "ffmpeg", extra_args = None, pos_args: dict[int, list[str]] | None = None,
 ):
-
 	preset = ["-preset", preset] if preset else []
 	crf = ["-crf", str(crf)] if crf else []
 
 	pos_args = pos_args or { }
 	audio = []
 	if audio_source_path is not None:
+		audio_seek = []
+		if audio_start:
+			audio_seek = ["-ss", audio_start]
+
 		audio = [
+			*audio_seek,
 			"-i", str(audio_source_path),
 			*(["-shortest"] if audio_shortest else []),
 			*(pos_args.get(2) or []),
@@ -149,11 +170,21 @@ def create_video_from_frame_gen(
 		ensure(exitcode == 0)
 
 
-def add_audio(video_path: Path, audio_source_path: Path, target_path: Path, ffmpeg = "ffmpeg", extra_args = None, shortest = False):
+def add_audio(
+		video_path: Path, audio_source_path: Path, target_path: Path,
+		audio_start = None,
+		ffmpeg = "ffmpeg", extra_args = None, shortest = False,
+):
 	# TODI: fix timestamps?
+
+	audio_seek = []
+	if audio_start:
+		audio_seek = ["-ss", audio_start]
+
 	subprocess.check_output([
 		ffmpeg, "-n", *(extra_args or []),
 		"-i", str(video_path),
+		*audio_seek,
 		"-i", str(audio_source_path),
 		*(["-shortest"] if shortest else []),
 		"-c:v", "copy", "-map", "0:v:0", "-map", "1:a:0",
@@ -161,9 +192,10 @@ def add_audio(video_path: Path, audio_source_path: Path, target_path: Path, ffmp
 	])
 
 
-def create_video_with_audio(
+def create_video_from_sequence(
 		frames_dir: Path, fps: int | float, target: Path,
 		audio_source_path: Path | str = None, audio_shortest: bool = False,
+		audio_start = None,
 		filename_pattern = "%05d.png",
 		crf: int | None = None, preset: str | None = None,
 		ffmpeg = "ffmpeg", extra_args = None, pos_args: dict[int, list[str]] | None = None,
@@ -174,7 +206,12 @@ def create_video_with_audio(
 	pos_args = pos_args or { }
 	audio = []
 	if audio_source_path is not None:
+		audio_seek = []
+		if audio_start:
+			audio_seek = ["-ss", audio_start]
+
 		audio = [
+			*audio_seek,
 			"-i", str(audio_source_path),
 			*(["-shortest"] if audio_shortest else []),
 			*(pos_args.get(2) or []),
@@ -263,10 +300,10 @@ def tmp_path_move_ctx(
 	if not (overwrite or overwrite_tmp) and tmp_path.exists():
 		raise FileExistsError(tmp_path)
 
-	if overwrite and (overwrite_delete or overwrite_delete_path) and path.exists():
+	if (overwrite or overwrite_path) and (overwrite_delete or overwrite_delete_path) and path.exists():
 		path.unlink(False)
 
-	if overwrite and (overwrite_delete or overwrite_delete_tmp) and tmp_path.exists():
+	if (overwrite or overwrite_tmp) and (overwrite_delete or overwrite_delete_tmp) and tmp_path.exists():
 		tmp_path.unlink(False)
 
 	def _move(target: Path):
