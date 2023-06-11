@@ -373,14 +373,9 @@ def _passthrough(i):
 	return i[1][0], (i[1][1], 0)
 
 
-def parallel_process_gen(swap_settings: SwapSettings, frame_gen, process_disk = False):
-	print(f"main proc {os.getpid()}")
-	print(f"procs_cpu={swap_settings.procs_cpu} use_gpu={swap_settings.use_gpu} procs_gpu={swap_settings.procs_gpu} ")
-
-	error_handling = ProcErrorHandling.Log if process_disk else ProcErrorHandling.Copy
-	settings = ProcessSettings(swap_settings.load_own_model, swap_settings, False, error_handling, noop)
+def _torch_device(swap_settings: SwapSettings):
 	if swap_settings.model_type == "torch" and swap_settings.use_gpu:
-		tdev = settings.swap_settings.torch_device
+		tdev = swap_settings.torch_device
 		devname = None
 		if isinstance(tdev, str):
 			devname = tdev
@@ -391,9 +386,20 @@ def parallel_process_gen(swap_settings: SwapSettings, frame_gen, process_disk = 
 				devname = "mps"
 
 		if devname:
-			settings.torch_device = torch.device(devname)
-			print("using torch device: ", repr(settings.torch_device))
+			return torch.device(devname)
 
+	return None
+
+
+def parallel_process_gen(swap_settings: SwapSettings, frame_gen, process_disk = False):
+	print(f"main proc {os.getpid()}")
+	print(f"procs_cpu={swap_settings.procs_cpu} use_gpu={swap_settings.use_gpu} procs_gpu={swap_settings.procs_gpu} ")
+
+	error_handling = ProcErrorHandling.Log if process_disk else ProcErrorHandling.Copy
+
+	dev = _torch_device(swap_settings)
+	print("using torch device: ", repr(dev))
+	settings = ProcessSettings(swap_settings.load_own_model, swap_settings, False, error_handling, noop, dev)
 	init_args = (settings,)
 	procs = swap_settings.procs_gpu if swap_settings.use_gpu else swap_settings.procs_cpu
 
@@ -427,7 +433,7 @@ def process_img(
 		swap_settings: SwapSettings, frame_path: Path, output_file: Path,
 		overwrite: bool = False,
 ):
-	settings = ProcessSettings(False, swap_settings, False)
+	settings = ProcessSettings(False, swap_settings, False, torch_device = _torch_device(swap_settings))
 	state = _setup(settings)
 
 	src_frame = cv2.imread(str(frame_path))
